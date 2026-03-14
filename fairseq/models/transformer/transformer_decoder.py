@@ -61,6 +61,7 @@ class TransformerDecoderBase(FairseqIncrementalDecoder):
         super().__init__(dictionary)
         self.register_buffer("version", torch.Tensor([3]))
         self._future_mask = torch.empty(0)
+        self._future_only_mask = torch.empty(0)
 
         self.dropout_module = FairseqDropout(
             cfg.dropout, module_name=module_name_fordropout(self.__class__.__name__)
@@ -110,6 +111,10 @@ class TransformerDecoderBase(FairseqIncrementalDecoder):
             self.layernorm_embedding = None
 
         self.cross_self_attention = cfg.cross_self_attention
+        self.future_mask_decoder_layers = self._parse_future_mask_layers(
+            cfg.future_mask_decoder_layers
+        )
+        self.future_mask_allow_self = cfg.future_mask_allow_self
 
         if self.decoder_layerdrop > 0.0:
             self.layers = LayerDropModuleList(p=self.decoder_layerdrop)
@@ -210,6 +215,26 @@ class TransformerDecoderBase(FairseqIncrementalDecoder):
         min_params_to_wrap = cfg.min_params_to_wrap if not checkpoint else 0
         layer = fsdp_wrap(layer, min_num_params=min_params_to_wrap)
         return layer
+
+    def _parse_future_mask_layers(self, configured_layers: Optional[Any]):
+        if configured_layers is None:
+            return set()
+        if isinstance(configured_layers, str):
+            if configured_layers.strip() == "":
+                return set()
+            return {
+                int(idx.strip())
+                for idx in configured_layers.split(",")
+                if idx.strip()
+            }
+        return {int(idx) for idx in configured_layers}
+
+    def _select_decoder_self_attn_mask(self, idx: int, x: Tensor):
+        if idx in self.future_mask_decoder_layers:
+            return self.buffered_future_only_mask(
+                x, allow_self=self.future_mask_allow_self
+            )
+        return self.buffered_future_mask(x)
 
     def forward(
         self,
@@ -370,7 +395,7 @@ class TransformerDecoderBase(FairseqIncrementalDecoder):
         for idx, layer in enumerate(self.layers):
             if not self.cfg.alibi:
                 if incremental_state is None and not full_context_alignment:
-                    self_attn_mask = self.buffered_future_mask(x)
+                    self_attn_mask = self._select_decoder_self_attn_mask(idx, x)
                 else:
                     self_attn_mask = None
 
@@ -456,6 +481,23 @@ class TransformerDecoderBase(FairseqIncrementalDecoder):
             )
         self._future_mask = self._future_mask.to(tensor)
         return self._future_mask[:dim, :dim]
+
+    def buffered_future_only_mask(self, tensor, allow_self: bool = True):
+        dim = tensor.size(0)
+        # Attn mask contains -inf for disallowed positions.
+        # For future-only attention we mask the strict past (j < i), and optionally
+        # the diagonal (j == i).
+        diagonal = -1 if allow_self else 0
+        if (
+            self._future_only_mask.size(0) == 0
+            or (not self._future_only_mask.device == tensor.device)
+            or self._future_only_mask.size(0) < dim
+        ):
+            self._future_only_mask = torch.tril(
+                utils.fill_with_neg_inf(torch.zeros([dim, dim])), diagonal
+            )
+        self._future_only_mask = self._future_only_mask.to(tensor)
+        return self._future_only_mask[:dim, :dim]
 
     def upgrade_state_dict_named(self, state_dict, name):
         """Upgrade a (possibly old) state dict for new versions of fairseq."""

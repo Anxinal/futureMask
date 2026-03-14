@@ -31,6 +31,45 @@ To reconstruct The Pile subset data we used for the experiments in the paper, se
 
 The preprocessed dataset (validation set) can be found at [link](https://drive.google.com/drive/folders/1avrK37tzBAVidZSE79b8vQCNcLLpNc-u?usp=sharing).
     
+
+## Future-mask experiment (NoPos + mixed masking)
+
+This codebase now supports mixing **causal** and **future-only** self-attention masks per decoder layer in `transformer_lm`, while keeping NoPos behavior via `--no-token-positional-embeddings`.
+
+Use these model args:
+- `--no-token-positional-embeddings` for NoPos.
+- `--future-mask-decoder-layers "0,3,5"` to make selected decoder layers use future-only attention.
+- `--future-mask-allow-self` (default: true) to allow each token to attend to itself in those future-masked layers.
+
+If `--future-mask-decoder-layers` is omitted, all layers stay standard causal (baseline).
+
+Example comparison setup on The Pile (same data/training config, only mask mode differs):
+
+```bash
+# 1) Baseline causal NoPos
+python fairseq_cli/train.py \
+  --task language_modeling \
+  --arch transformer_lm \
+  --no-token-positional-embeddings \
+  --tokens-per-sample 1024 \
+  --sample-break-mode none \
+  --criterion cross_entropy \
+  --max-update 100000 \
+  <other-your-pile-training-args>
+
+# 2) Mixed mask NoPos (selected layers are future-only)
+python fairseq_cli/train.py \
+  --task language_modeling \
+  --arch transformer_lm \
+  --no-token-positional-embeddings \
+  --future-mask-decoder-layers "0,3,5" \
+  --tokens-per-sample 1024 \
+  --sample-break-mode none \
+  --criterion cross_entropy \
+  --max-update 100000 \
+  <other-your-pile-training-args>
+```
+
 ## Citation
 
 If you find this work helpful, please cite us
