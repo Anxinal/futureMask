@@ -180,6 +180,26 @@ class TransformerLanguageModelConfig(FairseqDataclass):
         metadata={"help": "use alibi position bias (in the decoder)"},
     )
 
+    future_mask_decoder_layers: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "comma-separated 0-based decoder layer indices that use a future-only "
+                "(anti-causal) self-attention mask; e.g. '0,3,5'"
+            )
+        },
+    )
+
+    future_mask_allow_self: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "when using future-only masks, allow each token to attend to itself "
+                "to avoid empty attention rows"
+            )
+        },
+    )
+
     # config for Fully Sharded Data Parallel (FSDP) training
     min_params_to_wrap: int = field(
         default=DEFAULT_MIN_PARAMS_TO_WRAP,
@@ -393,6 +413,10 @@ def base_lm_architecture(args):
     args.scale_attn = safe_getattr(args, "scale_attn", False)
     args.scale_heads = safe_getattr(args, "scale_heads", False)
     args.scale_resids = safe_getattr(args, "scale_resids", False)
+    args.future_mask_decoder_layers = safe_getattr(
+        args, "future_mask_decoder_layers", None
+    )
+    args.future_mask_allow_self = safe_getattr(args, "future_mask_allow_self", True)
     if args.offload_activations:
         args.checkpoint_activations = True
 
