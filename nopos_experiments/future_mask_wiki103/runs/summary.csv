@@ -1,0 +1,5 @@
+future_mask_heads,save_dir,train_loss,last_valid_loss,best_valid_loss,best_valid_num_updates
+0,nopos_experiments\future_mask_wiki103\proxy_cpu_100u_512tok\future_heads_0,18.905,15.767,15.767,100
+1,nopos_experiments\future_mask_wiki103\proxy_cpu_100u_512tok\future_heads_1,18.766,15.178,15.178,100
+2,nopos_experiments\future_mask_wiki103\proxy_cpu_100u_512tok\future_heads_2,18.707,15.004,15.004,100
+4,nopos_experiments\future_mask_wiki103\proxy_cpu_100u_512tok\future_heads_4,18.639,14.903,14.903,100

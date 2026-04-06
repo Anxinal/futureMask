@@ -113,6 +113,24 @@ class MultiheadAttention(nn.Module):
         if self.bias_v is not None:
             nn.init.xavier_normal_(self.bias_v)
 
+    @staticmethod
+    def _append_attn_mask_padding(attn_mask: Optional[Tensor], target_len: int = 1):
+        if attn_mask is None:
+            return None
+        if attn_mask.dim() == 2:
+            return torch.cat(
+                [attn_mask, attn_mask.new_zeros(attn_mask.size(0), target_len)], dim=1
+            )
+        if attn_mask.dim() == 3:
+            return torch.cat(
+                [
+                    attn_mask,
+                    attn_mask.new_zeros(attn_mask.size(0), attn_mask.size(1), target_len),
+                ],
+                dim=2,
+            )
+        raise ValueError(f"attn_mask with dim={attn_mask.dim()} is not supported")
+
     def _get_reserve_head_index(self, num_heads_to_keep: int):
         k_proj_heads_norm = []
         q_proj_heads_norm = []
@@ -365,10 +383,7 @@ class MultiheadAttention(nn.Module):
             assert self.bias_v is not None
             k = torch.cat([k, self.bias_k.repeat(1, bsz, 1)])
             v = torch.cat([v, self.bias_v.repeat(1, bsz, 1)])
-            if attn_mask is not None:
-                attn_mask = torch.cat(
-                    [attn_mask, attn_mask.new_zeros(attn_mask.size(0), 1)], dim=1
-                )
+            attn_mask = self._append_attn_mask_padding(attn_mask)
             if key_padding_mask is not None:
                 key_padding_mask = torch.cat(
                     [
@@ -452,10 +467,7 @@ class MultiheadAttention(nn.Module):
             src_len += 1
             k = torch.cat([k, k.new_zeros((k.size(0), 1) + k.size()[2:])], dim=1)
             v = torch.cat([v, v.new_zeros((v.size(0), 1) + v.size()[2:])], dim=1)
-            if attn_mask is not None:
-                attn_mask = torch.cat(
-                    [attn_mask, attn_mask.new_zeros(attn_mask.size(0), 1)], dim=1
-                )
+            attn_mask = self._append_attn_mask_padding(attn_mask)
             if key_padding_mask is not None:
                 key_padding_mask = torch.cat(
                     [
@@ -473,9 +485,28 @@ class MultiheadAttention(nn.Module):
         assert list(attn_weights.size()) == [bsz * self.num_heads, tgt_len, src_len]
 
         if attn_mask is not None:
-            attn_mask = attn_mask.unsqueeze(0)
-            if self.onnx_trace:
-                attn_mask = attn_mask.repeat(attn_weights.size(0), 1, 1)
+            if attn_mask.dim() == 2:
+                attn_mask = attn_mask.unsqueeze(0)
+                if self.onnx_trace:
+                    attn_mask = attn_mask.repeat(attn_weights.size(0), 1, 1)
+            elif attn_mask.dim() == 3:
+                if attn_mask.size(0) == self.num_heads:
+                    attn_mask = attn_mask.repeat(bsz, 1, 1)
+                elif attn_mask.size(0) == 1 and self.onnx_trace:
+                    attn_mask = attn_mask.repeat(attn_weights.size(0), 1, 1)
+                elif attn_mask.size(0) != attn_weights.size(0):
+                    raise ValueError(
+                        "3D attn_mask must have leading dim equal to 1, num_heads, "
+                        "or bsz*num_heads (got {}, expected 1, {}, or {})".format(
+                            attn_mask.size(0),
+                            self.num_heads,
+                            attn_weights.size(0),
+                        )
+                    )
+            else:
+                raise ValueError(
+                    f"attn_mask with dim={attn_mask.dim()} is not supported"
+                )
             attn_weights += attn_mask
 
         if key_padding_mask is not None:

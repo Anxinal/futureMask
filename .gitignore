@@ -9,6 +9,9 @@ __pycache__/
 # Distribution / packaging
 .Python
 build/
+.vendor_cpuexp/
+.venv_cpuexp/
+
 develop-eggs/
 dist/
 downloads/

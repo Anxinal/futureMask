@@ -1,0 +1,34 @@
+[
+  {
+    "future_mask_heads": 0,
+    "save_dir": "nopos_experiments\\future_mask_wiki103\\proxy_cpu_100u_512tok\\future_heads_0",
+    "train_loss": 18.905,
+    "last_valid_loss": 15.767,
+    "best_valid_loss": 15.767,
+    "best_valid_num_updates": 100
+  },
+  {
+    "future_mask_heads": 1,
+    "save_dir": "nopos_experiments\\future_mask_wiki103\\proxy_cpu_100u_512tok\\future_heads_1",
+    "train_loss": 18.766,
+    "last_valid_loss": 15.178,
+    "best_valid_loss": 15.178,
+    "best_valid_num_updates": 100
+  },
+  {
+    "future_mask_heads": 2,
+    "save_dir": "nopos_experiments\\future_mask_wiki103\\proxy_cpu_100u_512tok\\future_heads_2",
+    "train_loss": 18.707,
+    "last_valid_loss": 15.004,
+    "best_valid_loss": 15.004,
+    "best_valid_num_updates": 100
+  },
+  {
+    "future_mask_heads": 4,
+    "save_dir": "nopos_experiments\\future_mask_wiki103\\proxy_cpu_100u_512tok\\future_heads_4",
+    "train_loss": 18.639,
+    "last_valid_loss": 14.903,
+    "best_valid_loss": 14.903,
+    "best_valid_num_updates": 100
+  }
+]

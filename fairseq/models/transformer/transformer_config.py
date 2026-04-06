@@ -254,6 +254,26 @@ class TransformerConfig(FairseqDataclass):
         },
     )
 
+    future_mask_heads: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "number of decoder self-attention heads per layer that use a "
+                "future-only mask instead of the standard causal mask"
+            )
+        },
+    )
+
+    future_mask_head_indices: Optional[List[int]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "0-based decoder self-attention head indices that use a "
+                "future-only mask; overrides future_mask_heads when set"
+            )
+        },
+    )
+
 
 
     # We need to make this hierarchical dataclass like the flat namespace

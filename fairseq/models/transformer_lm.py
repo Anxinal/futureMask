@@ -200,6 +200,26 @@ class TransformerLanguageModelConfig(FairseqDataclass):
         },
     )
 
+    future_mask_heads: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "number of decoder self-attention heads per layer that use a "
+                "future-only mask instead of the standard causal mask"
+            )
+        },
+    )
+
+    future_mask_head_indices: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "comma-separated 0-based decoder self-attention head indices that "
+                "use a future-only mask; overrides --future-mask-heads when set"
+            )
+        },
+    )
+
     # config for Fully Sharded Data Parallel (FSDP) training
     min_params_to_wrap: int = field(
         default=DEFAULT_MIN_PARAMS_TO_WRAP,
@@ -417,6 +437,10 @@ def base_lm_architecture(args):
         args, "future_mask_decoder_layers", None
     )
     args.future_mask_allow_self = safe_getattr(args, "future_mask_allow_self", True)
+    args.future_mask_heads = safe_getattr(args, "future_mask_heads", 0)
+    args.future_mask_head_indices = safe_getattr(
+        args, "future_mask_head_indices", None
+    )
     if args.offload_activations:
         args.checkpoint_activations = True
 
