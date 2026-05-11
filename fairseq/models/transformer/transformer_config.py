@@ -48,6 +48,25 @@ class EncDecBaseConfig(FairseqDataclass):
     layers_to_keep: Optional[List[int]] = field(
         default=None, metadata={"help": "which layers to *keep* when pruning"}
     )
+    # per-head self-attention masks for the future-mask experiment (encoder only;
+    # the decoder ignores these fields).
+    head_mask_spec: str = field(
+        default="",
+        metadata={
+            "help": (
+                "per-head encoder self-attention mask spec, comma-separated "
+                "tokens (one per head): C=causal, F=future-only, B=bidirectional. "
+                "Empty string disables per-head masking (default bidirectional). "
+                "Only honoured by the encoder."
+            )
+        },
+    )
+    future_mask_allow_self: bool = field(
+        default=True,
+        metadata={
+            "help": "for F (future-only) encoder heads, include the diagonal (self-attention)"
+        },
+    )
 
 
 @dataclass
@@ -104,13 +123,13 @@ class TransformerConfig(FairseqDataclass):
         },
     )
     adaptive_input: bool = False
-    encoder: EncDecBaseConfig = EncDecBaseConfig()
+    encoder: EncDecBaseConfig = field(default_factory=EncDecBaseConfig)
     # TODO should really be in the encoder config
     max_source_positions: int = field(
         default=DEFAULT_MAX_SOURCE_POSITIONS,
         metadata={"help": "Maximum input length supported by the encoder"},
     )
-    decoder: DecoderConfig = DecoderConfig()
+    decoder: DecoderConfig = field(default_factory=DecoderConfig)
     # TODO should really be in the decoder config
     max_target_positions: int = field(
         default=DEFAULT_MAX_TARGET_POSITIONS,
@@ -182,7 +201,7 @@ class TransformerConfig(FairseqDataclass):
         default=False, metadata={"help": "perform cross+self-attention"}
     )
     # args for Training with Quantization Noise for Extreme Model Compression ({Fan*, Stock*} et al., 2020)
-    quant_noise: QuantNoiseConfig = field(default=QuantNoiseConfig())
+    quant_noise: QuantNoiseConfig = field(default_factory=QuantNoiseConfig)
     min_params_to_wrap: int = field(
         default=DEFAULT_MIN_PARAMS_TO_WRAP,
         metadata={
