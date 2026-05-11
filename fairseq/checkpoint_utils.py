@@ -312,7 +312,7 @@ def load_checkpoint_to_cpu(path, arg_overrides=None, load_on_all_ranks=False):
         local_path = PathManager.get_local_path(path)
 
     with open(local_path, "rb") as f:
-        state = torch.load(f, map_location=torch.device("cpu"))
+        state = torch.load(f, map_location=torch.device("cpu"), weights_only=False)
 
     if "args" in state and state["args"] is not None and arg_overrides is not None:
         args = state["args"]
@@ -325,12 +325,13 @@ def load_checkpoint_to_cpu(path, arg_overrides=None, load_on_all_ranks=False):
         # omegaconf version that supports object flags, or when we migrate all existing models
         from omegaconf import _utils
 
-        old_primitive = _utils.is_primitive_type
-        _utils.is_primitive_type = lambda _: True
+        _attr = "is_primitive_type" if hasattr(_utils, "is_primitive_type") else "is_primitive_type_annotation"
+        old_primitive = getattr(_utils, _attr)
+        setattr(_utils, _attr, lambda _: True)
 
         state["cfg"] = OmegaConf.create(state["cfg"])
 
-        _utils.is_primitive_type = old_primitive
+        setattr(_utils, _attr, old_primitive)
         OmegaConf.set_struct(state["cfg"], True)
 
         if arg_overrides is not None:
