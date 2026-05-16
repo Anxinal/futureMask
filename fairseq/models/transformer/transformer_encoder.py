@@ -25,6 +25,10 @@ from torch import Tensor
 from fairseq.models.transformer import (
     TransformerConfig,
 )
+from fairseq.models.transformer.encoder_head_mask import (
+    build_per_head_encoder_mask,
+    parse_head_mask_spec,
+)
 
 
 # rewrite name for backward compatibility in `make_generation_fast_`
@@ -102,6 +106,14 @@ class TransformerEncoderBase(FairseqEncoder):
             self.layer_norm = LayerNorm(embed_dim, export=cfg.export)
         else:
             self.layer_norm = None
+
+        self.encoder_head_mask_spec = parse_head_mask_spec(
+            getattr(cfg.encoder, "head_mask_spec", "") or "",
+            cfg.encoder.attention_heads,
+        )
+        self.encoder_future_mask_allow_self = bool(
+            getattr(cfg.encoder, "future_mask_allow_self", True)
+        )
 
     def build_encoder_layer(self, cfg):
         layer = transformer_layer.TransformerEncoderLayerBase(
@@ -220,10 +232,23 @@ class TransformerEncoderBase(FairseqEncoder):
         if return_all_hiddens:
             encoder_states.append(x)
 
+        attn_mask = None
+        if self.encoder_head_mask_spec:
+            T = x.size(0)
+            attn_mask = build_per_head_encoder_mask(
+                self.encoder_head_mask_spec,
+                T,
+                device=x.device,
+                dtype=x.dtype,
+                allow_self=self.encoder_future_mask_allow_self,
+            )
+
         # encoder layers
         for layer in self.layers:
             lr = layer(
-                x, encoder_padding_mask=encoder_padding_mask if has_pads else None
+                x,
+                encoder_padding_mask=encoder_padding_mask if has_pads else None,
+                attn_mask=attn_mask,
             )
 
             if isinstance(lr, tuple) and len(lr) == 2:
