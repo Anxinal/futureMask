@@ -363,14 +363,19 @@ def override_module_args(args: Namespace) -> Tuple[List[str], List[str]]:
 
 
 class omegaconf_no_object_check:
+    # The function this monkey-patches was renamed in newer omegaconf releases;
+    # try both names so we work on both old (is_primitive_type) and new
+    # (is_primitive_type_annotation) versions.
+    _attr = "is_primitive_type" if hasattr(_utils, "is_primitive_type") else "is_primitive_type_annotation"
+
     def __init__(self):
-        self.old_is_primitive = _utils.is_primitive_type
+        self.old_is_primitive = getattr(_utils, self._attr)
 
     def __enter__(self):
-        _utils.is_primitive_type = lambda _: True
+        setattr(_utils, self._attr, lambda _: True)
 
     def __exit__(self, type, value, traceback):
-        _utils.is_primitive_type = self.old_is_primitive
+        setattr(_utils, self._attr, self.old_is_primitive)
 
 
 def convert_namespace_to_omegaconf(args: Namespace) -> DictConfig:

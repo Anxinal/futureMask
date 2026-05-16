@@ -177,6 +177,8 @@ def main(cfg: FairseqConfig) -> None:
 
     train_meter = meters.StopwatchMeter()
     train_meter.start()
+    final_valid_losses = [None]
+    final_train_loss = None
     while epoch_itr.next_epoch_idx <= max_epoch:
         if lr <= cfg.optimization.stop_min_lr:
             logger.info(
@@ -187,7 +189,9 @@ def main(cfg: FairseqConfig) -> None:
             break
 
         # train for one epoch
-        valid_losses, should_stop = train(cfg, trainer, task, epoch_itr)
+        valid_losses, should_stop, train_loss = train(cfg, trainer, task, epoch_itr)
+        final_valid_losses = valid_losses
+        final_train_loss = train_loss
         if should_stop:
             break
 
@@ -203,6 +207,20 @@ def main(cfg: FairseqConfig) -> None:
         )
     train_meter.stop()
     logger.info("done training in {:.1f} seconds".format(train_meter.sum))
+
+    final_valid_loss = final_valid_losses[0] if final_valid_losses else None
+    final_ppl_source = (
+        final_valid_loss if final_valid_loss is not None else final_train_loss
+    )
+    if final_ppl_source is not None:
+        logger.info(
+            "Final perplexity: %.2f (source=%s_loss %.6f)",
+            utils.get_perplexity(final_ppl_source),
+            "valid" if final_valid_loss is not None else "train",
+            final_ppl_source,
+        )
+    else:
+        logger.info("Final perplexity: unavailable (no train/valid loss recorded)")
 
     # ioPath implementation to wait for all asynchronous file writes to complete.
     if cfg.checkpoint.write_checkpoints_asynchronously:
@@ -245,7 +263,7 @@ def should_stop_early(cfg: DictConfig, valid_loss: float) -> bool:
 @metrics.aggregate("train")
 def train(
     cfg: DictConfig, trainer: Trainer, task: tasks.FairseqTask, epoch_itr
-) -> Tuple[List[Optional[float]], bool]:
+) -> Tuple[List[Optional[float]], bool, Optional[float]]:
     """Train the model for one epoch and return validation losses."""
     # Initialize data iterator
     itr = epoch_itr.next_epoch_itr(
@@ -310,6 +328,7 @@ def train(
             if num_updates % cfg.common.log_interval == 0:
                 stats = get_training_stats(metrics.get_smoothed_values("train_inner"))
                 progress.log(stats, tag="train_inner", step=num_updates)
+                _log_training_loss(stats, num_updates, epoch_itr.epoch)
 
                 # reset mid-epoch stats after each log interval
                 # the end-of-epoch stats will still be preserved
@@ -327,10 +346,29 @@ def train(
     logger.info("end of epoch {} (average epoch stats below)".format(epoch_itr.epoch))
     stats = get_training_stats(metrics.get_smoothed_values("train"))
     progress.print(stats, tag="train", step=num_updates)
+    _log_training_loss(stats, num_updates, epoch_itr.epoch)
 
     # reset epoch-level meters
     metrics.reset_meters("train")
-    return valid_losses, should_stop
+    return valid_losses, should_stop, stats.get("loss")
+
+
+def _log_training_loss(stats: Dict[str, Any], num_updates: int, epoch: int) -> None:
+    """Print explicit train loss/ppl logs at each reporting step."""
+    loss = stats.get("loss")
+    nll_loss = stats.get("nll_loss")
+    ppl = stats.get("ppl")
+    if loss is None and nll_loss is None:
+        return
+
+    parts = [f"epoch={epoch}", f"num_updates={num_updates}"]
+    if loss is not None:
+        parts.append(f"loss={loss}")
+    if nll_loss is not None:
+        parts.append(f"nll_loss={nll_loss}")
+    if ppl is not None:
+        parts.append(f"ppl={ppl}")
+    logger.info("train metrics | " + " | ".join(parts))
 
 
 def _flatten_config(cfg: DictConfig):

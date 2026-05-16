@@ -308,6 +308,14 @@ class MultiheadAttention(nn.Module):
                 assert value is not None
                 assert src_len, bsz == value.shape[:2]
 
+        # Per-head 3D masks are passed as [H, T, T]; the PyTorch fast path expects
+        # [B*H, T, T] for 3D masks. Bypass the fast path so our custom forward can
+        # broadcast the mask across the batch dimension.
+        is_per_head_mask = (
+            attn_mask is not None
+            and attn_mask.dim() == 3
+            and attn_mask.size(0) == self.num_heads
+        )
         if (
             not self.onnx_trace
             and not is_tpu  # don't use PyTorch version on TPUs
@@ -321,6 +329,7 @@ class MultiheadAttention(nn.Module):
             # Since pruning will break the dimension check and it is not easy to modify the pytorch API,
             # it is preferred to bypass the pytorch MHA when we need to skip embed_dim_check
             and not self.skip_embed_dim_check
+            and not is_per_head_mask
         ):
             assert key is not None and value is not None
             return F.multi_head_attention_forward(
@@ -485,28 +494,17 @@ class MultiheadAttention(nn.Module):
         assert list(attn_weights.size()) == [bsz * self.num_heads, tgt_len, src_len]
 
         if attn_mask is not None:
-            if attn_mask.dim() == 2:
+            if attn_mask.dim() == 3 and attn_mask.size(0) == self.num_heads:
+                # Per-head mask: [H, T_q, T_k] -> broadcast over batch -> [B*H, T_q, T_k]
+                attn_mask = (
+                    attn_mask.unsqueeze(0)
+                    .expand(bsz, -1, -1, -1)
+                    .reshape(bsz * self.num_heads, tgt_len, src_len)
+                )
+            else:
                 attn_mask = attn_mask.unsqueeze(0)
                 if self.onnx_trace:
                     attn_mask = attn_mask.repeat(attn_weights.size(0), 1, 1)
-            elif attn_mask.dim() == 3:
-                if attn_mask.size(0) == self.num_heads:
-                    attn_mask = attn_mask.repeat(bsz, 1, 1)
-                elif attn_mask.size(0) == 1 and self.onnx_trace:
-                    attn_mask = attn_mask.repeat(attn_weights.size(0), 1, 1)
-                elif attn_mask.size(0) != attn_weights.size(0):
-                    raise ValueError(
-                        "3D attn_mask must have leading dim equal to 1, num_heads, "
-                        "or bsz*num_heads (got {}, expected 1, {}, or {})".format(
-                            attn_mask.size(0),
-                            self.num_heads,
-                            attn_weights.size(0),
-                        )
-                    )
-            else:
-                raise ValueError(
-                    f"attn_mask with dim={attn_mask.dim()} is not supported"
-                )
             attn_weights += attn_mask
 
         if key_padding_mask is not None:

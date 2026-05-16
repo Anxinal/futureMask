@@ -62,7 +62,10 @@ class TransformerDecoderBase(FairseqIncrementalDecoder):
         self.register_buffer("version", torch.Tensor([3]))
         self._future_mask = torch.empty(0)
         self._future_only_mask = torch.empty(0)
-        self._mixed_future_head_mask = torch.empty(0)
+        # Whether this decoder is part of an encoder-decoder model (False = encoder-decoder,
+        # True = decoder-only LM). Used to force vanilla causal masks in the encoder-decoder
+        # case, where the per-layer future-mask experiment does not apply.
+        self.no_encoder_attn = no_encoder_attn
 
         self.dropout_module = FairseqDropout(
             cfg.dropout, module_name=module_name_fordropout(self.__class__.__name__)
@@ -268,6 +271,11 @@ class TransformerDecoderBase(FairseqIncrementalDecoder):
         return tuple(sorted(set(indices)))
 
     def _select_decoder_self_attn_mask(self, idx: int, x: Tensor):
+        # Encoder-decoder models always use vanilla causal masks in the decoder
+        # self-attention; the per-layer future-mask experiment only applies to
+        # the decoder-only LM setup (where no_encoder_attn=True).
+        if not self.no_encoder_attn:
+            return self.buffered_future_mask(x)
         if idx in self.future_mask_decoder_layers:
             return self.buffered_future_only_mask(
                 x, allow_self=self.future_mask_allow_self

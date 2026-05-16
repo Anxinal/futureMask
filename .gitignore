@@ -130,3 +130,11 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# encoder-decoder future-mask experiment artifacts
+/checkpoints/
+/data-bin/
+/wikitext-2/
+fairseq/version.py
+fairseq/data/data_utils_fast.cpp
+fairseq/data/token_block_utils_fast.cpp
