@@ -254,47 +254,6 @@ class TransformerConfig(FairseqDataclass):
     tokens_per_sample: int = II("task.tokens_per_sample")
 
 
-    future_mask_decoder_layers: Optional[List[int]] = field(
-        default=None,
-        metadata={
-            "help": (
-                "0-based decoder layer indices that use future-only "
-                "(anti-causal) self-attention masks"
-            )
-        },
-    )
-    future_mask_allow_self: bool = field(
-        default=True,
-        metadata={
-            "help": (
-                "when using future-only masks, allow each token to attend to "
-                "itself to avoid empty attention rows"
-            )
-        },
-    )
-
-    future_mask_heads: int = field(
-        default=0,
-        metadata={
-            "help": (
-                "number of decoder self-attention heads per layer that use a "
-                "future-only mask instead of the standard causal mask"
-            )
-        },
-    )
-
-    future_mask_head_indices: Optional[List[int]] = field(
-        default=None,
-        metadata={
-            "help": (
-                "0-based decoder self-attention head indices that use a "
-                "future-only mask; overrides future_mask_heads when set"
-            )
-        },
-    )
-
-
-
     # We need to make this hierarchical dataclass like the flat namespace
     # __getattr__ and __setattr__ here allow backward compatibility
     # for subclasses of Transformer(Legacy) that depend on read/write on

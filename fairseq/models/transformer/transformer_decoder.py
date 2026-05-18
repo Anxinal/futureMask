@@ -61,10 +61,6 @@ class TransformerDecoderBase(FairseqIncrementalDecoder):
         super().__init__(dictionary)
         self.register_buffer("version", torch.Tensor([3]))
         self._future_mask = torch.empty(0)
-        self._future_only_mask = torch.empty(0)
-        # Whether this decoder is part of an encoder-decoder model (False = encoder-decoder,
-        # True = decoder-only LM). Used to force vanilla causal masks in the encoder-decoder
-        # case, where the per-layer future-mask experiment does not apply.
         self.no_encoder_attn = no_encoder_attn
 
         self.dropout_module = FairseqDropout(
@@ -115,14 +111,6 @@ class TransformerDecoderBase(FairseqIncrementalDecoder):
             self.layernorm_embedding = None
 
         self.cross_self_attention = cfg.cross_self_attention
-        self.future_mask_decoder_layers = self._parse_future_mask_layers(
-            cfg.future_mask_decoder_layers
-        )
-        self.future_mask_allow_self = cfg.future_mask_allow_self
-        self.future_mask_head_indices = self._parse_future_mask_head_indices(
-            cfg.future_mask_head_indices, cfg.future_mask_heads
-        )
-        self.num_future_mask_heads = len(self.future_mask_head_indices)
 
         if self.decoder_layerdrop > 0.0:
             self.layers = LayerDropModuleList(p=self.decoder_layerdrop)
@@ -223,66 +211,6 @@ class TransformerDecoderBase(FairseqIncrementalDecoder):
         min_params_to_wrap = cfg.min_params_to_wrap if not checkpoint else 0
         layer = fsdp_wrap(layer, min_num_params=min_params_to_wrap)
         return layer
-
-    def _parse_future_mask_layers(self, configured_layers: Optional[Any]):
-        if configured_layers is None:
-            return set()
-        if isinstance(configured_layers, str):
-            if configured_layers.strip() == "":
-                return set()
-            return {
-                int(idx.strip())
-                for idx in configured_layers.split(",")
-                if idx.strip()
-            }
-        return {int(idx) for idx in configured_layers}
-
-    def _parse_future_mask_head_indices(
-        self, configured_indices: Optional[Any], configured_count: int
-    ):
-        if configured_indices is not None:
-            if isinstance(configured_indices, str):
-                if configured_indices.strip() == "":
-                    indices = []
-                else:
-                    indices = [
-                        int(idx.strip())
-                        for idx in configured_indices.split(",")
-                        if idx.strip()
-                    ]
-            else:
-                indices = [int(idx) for idx in configured_indices]
-        else:
-            count = int(configured_count or 0)
-            indices = list(range(count))
-
-        invalid_indices = [
-            idx
-            for idx in indices
-            if idx < 0 or idx >= self.cfg.decoder.attention_heads
-        ]
-        if invalid_indices:
-            raise ValueError(
-                "future mask head indices {} are outside the valid range [0, {})".format(
-                    invalid_indices, self.cfg.decoder.attention_heads
-                )
-            )
-
-        return tuple(sorted(set(indices)))
-
-    def _select_decoder_self_attn_mask(self, idx: int, x: Tensor):
-        # Encoder-decoder models always use vanilla causal masks in the decoder
-        # self-attention; the per-layer future-mask experiment only applies to
-        # the decoder-only LM setup (where no_encoder_attn=True).
-        if not self.no_encoder_attn:
-            return self.buffered_future_mask(x)
-        if idx in self.future_mask_decoder_layers:
-            return self.buffered_future_only_mask(
-                x, allow_self=self.future_mask_allow_self
-            )
-        if self.num_future_mask_heads > 0:
-            return self.buffered_mixed_future_head_mask(x)
-        return self.buffered_future_mask(x)
 
     def forward(
         self,
@@ -443,7 +371,7 @@ class TransformerDecoderBase(FairseqIncrementalDecoder):
         for idx, layer in enumerate(self.layers):
             if not self.cfg.alibi:
                 if incremental_state is None and not full_context_alignment:
-                    self_attn_mask = self._select_decoder_self_attn_mask(idx, x)
+                    self_attn_mask = self.buffered_future_mask(x)
                 else:
                     self_attn_mask = None
 
@@ -529,43 +457,6 @@ class TransformerDecoderBase(FairseqIncrementalDecoder):
             )
         self._future_mask = self._future_mask.to(tensor)
         return self._future_mask[:dim, :dim]
-
-    def buffered_future_only_mask(self, tensor, allow_self: bool = True):
-        dim = tensor.size(0)
-        # Attn mask contains -inf for disallowed positions.
-        # For future-only attention we mask the strict past (j < i), and optionally
-        # the diagonal (j == i).
-        diagonal = -1 if allow_self else 0
-        if (
-            self._future_only_mask.size(0) == 0
-            or (not self._future_only_mask.device == tensor.device)
-            or self._future_only_mask.size(0) < dim
-        ):
-            self._future_only_mask = torch.tril(
-                utils.fill_with_neg_inf(torch.zeros([dim, dim])), diagonal
-            )
-        self._future_only_mask = self._future_only_mask.to(tensor)
-        return self._future_only_mask[:dim, :dim]
-
-    def buffered_mixed_future_head_mask(self, tensor):
-        dim = tensor.size(0)
-        if (
-            self._mixed_future_head_mask.size(0) == 0
-            or (not self._mixed_future_head_mask.device == tensor.device)
-            or self._mixed_future_head_mask.size(1) < dim
-        ):
-            causal_mask = self.buffered_future_mask(tensor)
-            future_mask = self.buffered_future_only_mask(
-                tensor, allow_self=self.future_mask_allow_self
-            )
-            mixed_mask = causal_mask.unsqueeze(0).repeat(
-                self.cfg.decoder.attention_heads, 1, 1
-            )
-            if self.num_future_mask_heads > 0:
-                mixed_mask[list(self.future_mask_head_indices)] = future_mask
-            self._mixed_future_head_mask = mixed_mask
-        self._mixed_future_head_mask = self._mixed_future_head_mask.to(tensor)
-        return self._mixed_future_head_mask[:, :dim, :dim]
 
     def upgrade_state_dict_named(self, state_dict, name):
         """Upgrade a (possibly old) state dict for new versions of fairseq."""
