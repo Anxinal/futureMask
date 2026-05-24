@@ -147,7 +147,11 @@ class PathManager:
 
     @staticmethod
     def rename(src: str, dst: str):
-        os.rename(src, dst)
+        # On Windows, os.rename fails if dst already exists (unlike POSIX).
+        if os.name == "nt" and os.path.exists(dst):
+            os.replace(src, dst)
+        else:
+            os.rename(src, dst)
 
     """
     ioPath async PathManager methods:

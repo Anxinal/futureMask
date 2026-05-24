@@ -13,7 +13,7 @@ from typing import Tuple
 
 import torch
 
-from fairseq import utils
+from fairseq.models.transformer.masks import BidirectionalMask, CausalMask, FutureOnlyMask
 
 
 _VALID_TOKENS = ("C", "F", "B")
@@ -35,19 +35,6 @@ def parse_head_mask_spec(spec: str, num_heads: int) -> Tuple[str, ...]:
     return tokens
 
 
-def _causal_mask(T: int) -> torch.Tensor:
-    return torch.triu(utils.fill_with_neg_inf(torch.zeros([T, T])), 1)
-
-
-def _future_mask(T: int, allow_self: bool) -> torch.Tensor:
-    diagonal = -1 if allow_self else 0
-    return torch.tril(utils.fill_with_neg_inf(torch.zeros([T, T])), diagonal)
-
-
-def _bidir_mask(T: int) -> torch.Tensor:
-    return torch.zeros([T, T])
-
-
 @lru_cache(maxsize=32)
 def _build_cached(
     spec: Tuple[str, ...],
@@ -58,11 +45,11 @@ def _build_cached(
     heads = []
     for tok in spec:
         if tok == "C":
-            heads.append(_causal_mask(T))
+            heads.append(CausalMask(T).tensor)
         elif tok == "F":
-            heads.append(_future_mask(T, allow_self))
+            heads.append(FutureOnlyMask(T, allow_self=allow_self).tensor)
         elif tok == "B":
-            heads.append(_bidir_mask(T))
+            heads.append(BidirectionalMask(T).tensor)
         else:  # pragma: no cover - validated upstream
             raise ValueError(tok)
     return torch.stack(heads, dim=0)

@@ -138,3 +138,6 @@ dmypy.json
 fairseq/version.py
 fairseq/data/data_utils_fast.cpp
 fairseq/data/token_block_utils_fast.cpp
+
+#experiment local data
+/nopos_experiments/wiki103_trial

@@ -14,6 +14,7 @@ declare -A SPECS=(
     [8C]="C,C,C,C,C,C,C,C"
     [4F4C]="F,F,F,F,C,C,C,C"
     [8B]=""
+    [4C]="C,C,C,C"
 )
 
 CONDS=(8C 4F4C 8B)

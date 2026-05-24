@@ -1,0 +1,15 @@
+# Core dependencies (mirrors setup.py install_requires)
+# Install with: pip install -r requirements.txt
+# Then install the fairseq package itself with: pip install -e .
+
+torch
+torchaudio>=0.8.0
+numpy
+cffi
+cython
+hydra-core>=1.0.7,<1.1
+omegaconf<2.1
+regex
+sacrebleu>=1.4.12
+tqdm
+bitarray

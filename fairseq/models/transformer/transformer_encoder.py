@@ -25,10 +25,8 @@ from torch import Tensor
 from fairseq.models.transformer import (
     TransformerConfig,
 )
-from fairseq.models.transformer.encoder_head_mask import (
-    build_per_head_encoder_mask,
-    parse_head_mask_spec,
-)
+from fairseq.models.transformer.encoder_head_mask import parse_head_mask_spec
+from fairseq.models.transformer.masks import BidirectionalMask, CausalMask, FutureOnlyMask
 
 
 # rewrite name for backward compatibility in `make_generation_fast_`
@@ -235,13 +233,14 @@ class TransformerEncoderBase(FairseqEncoder):
         attn_mask = None
         if self.encoder_head_mask_spec:
             T = x.size(0)
-            attn_mask = build_per_head_encoder_mask(
-                self.encoder_head_mask_spec,
-                T,
-                device=x.device,
-                dtype=x.dtype,
-                allow_self=self.encoder_future_mask_allow_self,
-            )
+            _mask_map = {"C": CausalMask, "B": BidirectionalMask}
+            heads = [
+                FutureOnlyMask(T, allow_self=self.encoder_future_mask_allow_self).tensor
+                if tok == "F"
+                else _mask_map[tok](T).tensor
+                for tok in self.encoder_head_mask_spec
+            ]
+            attn_mask = torch.stack(heads, dim=0).to(device=x.device, dtype=x.dtype)
 
         # encoder layers
         for layer in self.layers:
