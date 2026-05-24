@@ -139,5 +139,9 @@ fairseq/version.py
 fairseq/data/data_utils_fast.cpp
 fairseq/data/token_block_utils_fast.cpp
 
-#experiment local data
-/nopos_experiments/wiki103_trial
+# experiment data: preprocessed datasets and checkpoints (generated on server)
+/nopos_experiments/wiki103_trial/
+nopos_experiments/**/*.pt
+nopos_experiments/**/smoke_run/
+nopos_experiments/**/checkpoints/
+nopos_experiments/**/data-bin/
