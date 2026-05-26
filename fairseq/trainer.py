@@ -57,6 +57,15 @@ class Trainer(object):
         # catalog shared parameters
         shared_params = _catalog_shared_params(model)
         self.tpu = cfg.common.tpu
+        # If tpu/bf16 flag is set but XLA is not available, fall back to CUDA/CPU
+        if self.tpu:
+            try:
+                from fairseq.distributed.utils import xm as _xm
+                if _xm is None:
+                    raise ImportError
+                _xm.xla_device()
+            except Exception:
+                self.tpu = False
         self.cuda = torch.cuda.is_available() and not cfg.common.cpu and not self.tpu
         if self.cuda:
             self.device = torch.device("cuda")

@@ -708,6 +708,10 @@ def new_arange(x, *size):
 
 
 def get_tpu_device():
+    if xm is None:
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        return torch.device("cpu")
     return xm.xla_device()
 
 
