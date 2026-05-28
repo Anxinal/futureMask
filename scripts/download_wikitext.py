@@ -10,7 +10,7 @@ SPLITS = [
 ]
 
 print("Loading wikitext-103-v1 from HuggingFace ...")
-ds = load_dataset("wikitext", "wikitext-103-v1")
+ds = load_dataset("Salesforce/wikitext", "wikitext-103-v1")
 
 for split, fname in SPLITS:
     path = f"{OUT}/{fname}"
