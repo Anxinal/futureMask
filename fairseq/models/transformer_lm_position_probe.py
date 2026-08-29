@@ -66,6 +66,18 @@ class TransformerLanguageModelPositionProbeConfig(TransformerLanguageModelConfig
             "help": "if set to true use MLP with 2 layers and RELU"}
     )
 
+    maskconfig: str = field(
+        default="",
+        metadata={
+            "help": (
+                "per-head decoder self-attention mask, one character per head: "
+                "C=causal, F=future-only, B=bidirectional. "
+                "e.g. 'CCCCBBBB' for 4 causal + 4 bidirectional heads. "
+                "Empty string uses the default causal mask for all heads."
+            )
+        },
+    )
+
 
 @register_model("transformer_lmpp", dataclass=TransformerLanguageModelPositionProbeConfig)
 class TransformerLanguageModelPositionProbe(TransformerLanguageModel):
@@ -151,6 +163,12 @@ class TransformerLanguageModelPositionProbe(TransformerLanguageModel):
             )
             assert args.decoder_input_dim == args.decoder_output_dim
 
+        # Propagate maskconfig to decoder.head_mask_spec so the decoder
+        # builds per-head masks in its self-attention.
+        maskconfig = safe_getattr(args, "maskconfig", "")
+        if maskconfig:
+            args.decoder_head_mask_spec = maskconfig
+
         decoder = TransformerDecoder(
             args, task.target_dictionary, embed_tokens, no_encoder_attn=True, output_projection=None
         )
@@ -212,6 +230,7 @@ def transformer_lm_baevski_wiki103(args):
     args.decoder_attention_heads = safe_getattr(args, "decoder_attention_heads", 8)
     args.dropout = safe_getattr(args, "dropout", 0.3)
     args.adaptive_input = safe_getattr(args, "adaptive_input", True)
+    args.maskconfig = safe_getattr(args, "maskconfig", "BBBBBBBB")
     args.tie_adaptive_weights = safe_getattr(args, "tie_adaptive_weights", True)
     args.adaptive_input_cutoff = safe_getattr(
         args, "adaptive_input_cutoff", "20000,60000"

@@ -48,23 +48,25 @@ class EncDecBaseConfig(FairseqDataclass):
     layers_to_keep: Optional[List[int]] = field(
         default=None, metadata={"help": "which layers to *keep* when pruning"}
     )
-    # per-head self-attention masks for the future-mask experiment (encoder only;
-    # the decoder ignores these fields).
+    # per-head self-attention masks for the future-mask experiment.
+    # Honoured by both encoder (--encoder-head-mask-spec) and
+    # decoder (--decoder-head-mask-spec) independently.
     head_mask_spec: str = field(
         default="",
         metadata={
             "help": (
-                "per-head encoder self-attention mask spec, comma-separated "
+                "per-head self-attention mask spec, comma-separated "
                 "tokens (one per head): C=causal, F=future-only, B=bidirectional. "
-                "Empty string disables per-head masking (default bidirectional). "
-                "Only honoured by the encoder."
+                "Empty string disables per-head masking. "
+                "Use --encoder-head-mask-spec / --decoder-head-mask-spec "
+                "to configure each side independently."
             )
         },
     )
     future_mask_allow_self: bool = field(
         default=True,
         metadata={
-            "help": "for F (future-only) encoder heads, include the diagonal (self-attention)"
+            "help": "for F (future-only) heads, include the diagonal (self-attention)"
         },
     )
 

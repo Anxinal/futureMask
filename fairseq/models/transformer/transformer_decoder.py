@@ -14,6 +14,7 @@ from fairseq import utils
 from fairseq.distributed import fsdp_wrap
 from fairseq.models import FairseqIncrementalDecoder
 from fairseq.models.transformer import TransformerConfig
+from fairseq.models.masks import CausalMask, FutureOnlyMask, BidirectionalMask
 from fairseq.modules import (
     AdaptiveSoftmax,
     BaseLayer,
@@ -128,6 +129,29 @@ class TransformerDecoderBase(FairseqIncrementalDecoder):
             self.layer_norm = LayerNorm(embed_dim, export=cfg.export)
         else:
             self.layer_norm = None
+
+        # Per-head decoder self-attention mask (mirrors encoder_head_mask_spec).
+        _raw_spec = getattr(cfg.decoder, "head_mask_spec", "") or ""
+        if _raw_spec:
+            # Support both comma-separated ("C,C,B,B") and compact ("CCBB") formats
+            if "," in _raw_spec:
+                tokens = tuple(tok.strip().upper() for tok in _raw_spec.split(","))
+            else:
+                tokens = tuple(_raw_spec.upper())
+            _valid = {"C", "F", "B"}
+            for tok in tokens:
+                if tok not in _valid:
+                    raise ValueError(f"invalid decoder head-mask token {tok!r}; expected one of {_valid}")
+            if len(tokens) != cfg.decoder.attention_heads:
+                raise ValueError(
+                    f"decoder head_mask_spec has {len(tokens)} tokens but num_heads={cfg.decoder.attention_heads}"
+                )
+            self.decoder_head_mask_spec = tokens
+        else:
+            self.decoder_head_mask_spec = ()
+        self.decoder_future_mask_allow_self = bool(
+            getattr(cfg.decoder, "future_mask_allow_self", True)
+        )
 
         self.project_out_dim = (
             Linear(embed_dim, self.output_embed_dim, bias=False)
@@ -365,16 +389,27 @@ class TransformerDecoderBase(FairseqIncrementalDecoder):
         if self.cross_self_attention or prev_output_tokens.eq(self.padding_idx).any():
             self_attn_padding_mask = prev_output_tokens.eq(self.padding_idx)
 
-        # decoder layers
+        # decoder layers — build self-attention mask once before the loop
+        if not self.cfg.alibi:
+            if incremental_state is None and not full_context_alignment:
+                if self.decoder_head_mask_spec:
+                    T = x.size(0)
+                    _mask_map = {"C": CausalMask, "B": BidirectionalMask}
+                    heads = [
+                        FutureOnlyMask(T, allow_self=self.decoder_future_mask_allow_self).tensor
+                        if tok == "F"
+                        else _mask_map[tok](T).tensor
+                        for tok in self.decoder_head_mask_spec
+                    ]
+                    self_attn_mask = torch.stack(heads, dim=0).to(device=x.device, dtype=x.dtype)
+                else:
+                    self_attn_mask = self.buffered_future_mask(x)
+            else:
+                self_attn_mask = None
+
         attn: Optional[Tensor] = None
         inner_states: List[Optional[Tensor]] = [x]
         for idx, layer in enumerate(self.layers):
-            if not self.cfg.alibi:
-                if incremental_state is None and not full_context_alignment:
-                    self_attn_mask = self.buffered_future_mask(x)
-                else:
-                    self_attn_mask = None
-
             x, layer_attn, _ = layer(
                 x,
                 enc,
