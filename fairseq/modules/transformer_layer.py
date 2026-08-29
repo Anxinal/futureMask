@@ -141,6 +141,7 @@ class TransformerEncoderLayerBase(nn.Module):
             self_attention=True,
             q_noise=self.quant_noise,
             qn_block_size=self.quant_noise_block_size,
+            use_rotary=getattr(cfg, "rotary_embedding", False),
         )
 
     def residual_connection(self, x, residual):
@@ -359,6 +360,7 @@ class TransformerDecoderLayerBase(nn.Module):
             self_attention=not cfg.cross_self_attention,
             q_noise=self.quant_noise,
             qn_block_size=self.quant_noise_block_size,
+            use_rotary=getattr(cfg, "rotary_embedding", False),
         )
 
     def build_encoder_attention(self, embed_dim, cfg):

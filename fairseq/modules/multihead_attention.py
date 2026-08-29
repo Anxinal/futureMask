@@ -15,6 +15,10 @@ from fairseq import utils
 from fairseq.incremental_decoding_utils import with_incremental_state
 from fairseq.modules.fairseq_dropout import FairseqDropout
 from fairseq.modules.quant_noise import quant_noise
+from fairseq.modules.rotary_positional_embedding import (
+    RotaryPositionalEmbedding,
+    apply_rotary_pos_emb,
+)
 
 
 @with_incremental_state
@@ -38,6 +42,7 @@ class MultiheadAttention(nn.Module):
         encoder_decoder_attention=False,
         q_noise=0.0,
         qn_block_size=8,
+        use_rotary=False,
     ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -84,6 +89,14 @@ class MultiheadAttention(nn.Module):
             self.bias_k = self.bias_v = None
 
         self.add_zero_attn = add_zero_attn
+
+        self.use_rotary = use_rotary
+        if use_rotary:
+            self.rotary_emb = RotaryPositionalEmbedding(
+                self.head_dim, precision=torch.float
+            )
+        else:
+            self.rotary_emb = None
 
         self.reset_parameters()
 
@@ -387,6 +400,17 @@ class MultiheadAttention(nn.Module):
             k = self.k_proj(key)
             v = self.v_proj(value)
         q *= self.scaling
+
+        # Apply rotary positional embeddings to Q and K
+        if self.rotary_emb is not None and k is not None:
+            # Reshape to [T, B, H, D] for RoPE
+            q = q.view(tgt_len, bsz, self.num_heads, self.head_dim)
+            k = k.view(-1, bsz, self.num_heads, self.head_dim)
+            cos, sin = self.rotary_emb(q, seq_len=q.shape[0])
+            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+            # Reshape back to [T, B, embed_dim]
+            q = q.view(tgt_len, bsz, self.embed_dim)
+            k = k.contiguous().view(-1, bsz, self.embed_dim)
 
         if self.bias_k is not None:
             assert self.bias_v is not None

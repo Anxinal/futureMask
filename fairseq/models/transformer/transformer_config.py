@@ -248,6 +248,11 @@ class TransformerConfig(FairseqDataclass):
         metadata={"help": "use alibi position bias (in the decoder)"},
     )
 
+    rotary_embedding: bool = field(
+        default=False,
+        metadata={"help": "use rotary positional embeddings (RoPE) in self-attention"},
+    )
+
     debug: bool = field(
         default=False,
         metadata={"help": "debug mode"},

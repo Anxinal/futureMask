@@ -63,6 +63,8 @@ def main():
     p.add_argument("--probe-layer", type=int, default=-1)
     p.add_argument("--max-tokens", type=int, default=2048)
     p.add_argument("--lr", type=float, default=5e-3)
+    p.add_argument("--eval-tokens-per-sample", type=int, default=0,
+                   help="override tokens_per_sample at eval time (0 = use training value)")
     p.add_argument("--output", required=True)
     p.add_argument("--cpu", action="store_true")
     args = p.parse_args()
@@ -73,6 +75,12 @@ def main():
     cfg = state["cfg"]
     # Point the task at the (possibly different) local data dir.
     cfg.task.data = args.data
+
+    # Override sequence length for extrapolation experiments
+    if args.eval_tokens_per_sample > 0:
+        cfg.task.tokens_per_sample = args.eval_tokens_per_sample
+        cfg.model.max_source_positions = args.eval_tokens_per_sample
+        cfg.model.max_target_positions = args.eval_tokens_per_sample
 
     global task  # used by _encoder_hidden
     task = tasks.setup_task(cfg.task)
