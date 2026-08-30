@@ -78,7 +78,7 @@ EVAL_LENGTHS=(512 1024 2048)
 # Conditions from experiment_instruction_refined.md + baselines:
 CONDITIONS=(
     "pos_8B|no|B,B,B,B,B,B,B,B|"
-    "rope_8B|yes|B,B,B,B,B,B,B,B|--rotary-embedding"
+    # "rope_8B|yes|B,B,B,B,B,B,B,B|--rotary-embedding"  # uncomment after verifying cluster has latest code
     "nopos_8B|yes|B,B,B,B,B,B,B,B|"
     "nopos_8C|yes|C,C,C,C,C,C,C,C|"
     "nopos_4F4C|yes|F,F,F,F,C,C,C,C|"
@@ -95,6 +95,7 @@ DATABIN="${REPO_DIR}/data-bin/wikitext-103"
 CHECKPOINTS_ROOT="${REPO_DIR}/checkpoints"
 PROBE_RESULTS="${REPO_DIR}/probe_results"
 REL_PROBE_RESULTS="${REPO_DIR}/rel_probe_results"
+REG_REL_PROBE_RESULTS="${REPO_DIR}/reg_rel_probe_results"
 
 echo "======================================================"
 echo "  Job ID       : ${SLURM_JOB_ID:-local}"
@@ -405,6 +406,53 @@ for EVAL_LEN in "${EVAL_LENGTHS[@]}"; do
 done
 
 # =============================================================================
+# Step 6b: Relative position probes -- regression (condition x layer x eval_length)
+# =============================================================================
+CURRENT_STAGE="Step 6b -- relative position probing (regression)"
+echo "[6b/7] Running relative position probes (regression) ..."
+
+mkdir -p "${REG_REL_PROBE_RESULTS}"
+
+for EVAL_LEN in "${EVAL_LENGTHS[@]}"; do
+    for cond_str in "${CONDITIONS[@]}"; do
+        IFS='|' read -r COND_NAME NOPOS_FLAG ENCODER_MASK COND_EXTRA <<< "${cond_str}"
+
+        CHECKPOINT="${CHECKPOINTS_ROOT}/${COND_NAME}/checkpoint_last.pt"
+        if [ ! -f "${CHECKPOINT}" ]; then
+            echo "      [${COND_NAME}] WARNING: checkpoint not found -- skipping."
+            continue
+        fi
+
+        for LAYER_IDX in "${PROBE_LAYERS[@]}"; do
+            PROBE_TAG="${COND_NAME}_layer${LAYER_IDX}_len${EVAL_LEN}"
+            REG_REL_OUT="${REG_REL_PROBE_RESULTS}/${PROBE_TAG}.json"
+
+            if [ -f "${REG_REL_OUT}" ]; then
+                echo "      [${PROBE_TAG}] Result exists -- skipping."
+                continue
+            fi
+
+            echo "      [${PROBE_TAG}] Training relative position probe (regression) ..."
+
+            "${PY}" "${REPO_DIR}/nopos_experiments/encdec_future_mask/run_relative_position_probe_regression.py" \
+                --checkpoint            "${CHECKPOINT}" \
+                --data                  "${DATABIN}" \
+                --split                 valid \
+                --train-split           train \
+                --probe-layer           "${LAYER_IDX}" \
+                --probe-updates         "${PROBE_MAX_UPDATES}" \
+                --lr                    "${PROBE_LR}" \
+                --max-tokens            "${PROBE_MAX_TOKENS}" \
+                --pairs-per-seq         "${REL_PROBE_PAIRS_PER_SEQ}" \
+                --eval-tokens-per-sample "${EVAL_LEN}" \
+                --output                "${REG_REL_OUT}"
+
+            echo "      [${PROBE_TAG}] Done."
+        done
+    done
+done
+
+# =============================================================================
 # Step 7: Summarise results
 # =============================================================================
 CURRENT_STAGE="Summary"
@@ -417,10 +465,10 @@ for EVAL_LEN in "${EVAL_LENGTHS[@]}"; do
     echo ""
     echo "--- Eval sequence length: ${EVAL_LEN} ---"
     echo ""
-    printf "%-25s %5s  %8s %8s  %8s %8s %8s\n" \
-        "CONDITION" "LAYER" "ABS_MAE" "ABS_ACC" "REL_MAE" "REL_ACC" "REL_DIR"
-    printf "%-25s %5s  %8s %8s  %8s %8s %8s\n" \
-        "-------------------------" "-----" "--------" "--------" "--------" "--------" "--------"
+    printf "%-25s %5s  %8s %8s  %8s %8s %8s  %8s %8s\n" \
+        "CONDITION" "LAYER" "ABS_MAE" "ABS_ACC" "REL_MAE" "REL_ACC" "REL_DIR" "RREG_MAE" "RREG_DIR"
+    printf "%-25s %5s  %8s %8s  %8s %8s %8s  %8s %8s\n" \
+        "-------------------------" "-----" "--------" "--------" "--------" "--------" "--------" "--------" "--------"
 
     for cond_str in "${CONDITIONS[@]}"; do
         IFS='|' read -r COND_NAME NOPOS_FLAG ENCODER_MASK COND_EXTRA <<< "${cond_str}"
@@ -446,8 +494,16 @@ for EVAL_LEN in "${EVAL_LENGTHS[@]}"; do
                 REL_MAE="N/A"; REL_ACC="N/A"; REL_DIR="N/A"
             fi
 
-            printf "%-25s %5s  %8s %8s  %8s %8s %8s\n" \
-                "${COND_NAME}" "${LAYER_IDX}" "${ABS_MAE}" "${ABS_ACC}" "${REL_MAE}" "${REL_ACC}" "${REL_DIR}"
+            REG_REL_OUT="${REG_REL_PROBE_RESULTS}/${PROBE_TAG}.json"
+            if [ -f "${REG_REL_OUT}" ]; then
+                RREG_MAE=$("${PY}" -c "import json; d=json.load(open('${REG_REL_OUT}')); print(f\"{d['reg_rel_probe_mae']:.3f}\")")
+                RREG_DIR=$("${PY}" -c "import json; d=json.load(open('${REG_REL_OUT}')); print(f\"{d['reg_rel_probe_dir_acc']:.3f}\")")
+            else
+                RREG_MAE="N/A"; RREG_DIR="N/A"
+            fi
+
+            printf "%-25s %5s  %8s %8s  %8s %8s %8s  %8s %8s\n" \
+                "${COND_NAME}" "${LAYER_IDX}" "${ABS_MAE}" "${ABS_ACC}" "${REL_MAE}" "${REL_ACC}" "${REL_DIR}" "${RREG_MAE}" "${RREG_DIR}"
         done
     done
 done
@@ -455,6 +511,7 @@ done
 echo ""
 echo "======================================================"
 echo "  Probe experiment complete."
-echo "  Absolute results : ${PROBE_RESULTS}/"
-echo "  Relative results : ${REL_PROBE_RESULTS}/"
+echo "  Absolute results           : ${PROBE_RESULTS}/"
+echo "  Relative results (cls)     : ${REL_PROBE_RESULTS}/"
+echo "  Relative results (reg)     : ${REG_REL_PROBE_RESULTS}/"
 echo "======================================================"
