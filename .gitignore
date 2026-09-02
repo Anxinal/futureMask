@@ -149,3 +149,5 @@ nopos_experiments/**/data-bin/
 # raw dataset text files (large, downloaded on server)
 examples/language_model/wikitext-103/
 examples/language_model/wikitext-2/
+
+runexpprobe.sh
