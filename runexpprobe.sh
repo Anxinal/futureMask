@@ -2,11 +2,10 @@
 #SBATCH --job-name=probe
 #SBATCH --output=probe_%j.out
 #SBATCH --error=probe_%j.err
-#SBATCH --nodelist=xgpi[0-20]
-#SBATCH --gpus = a100-80: 1
+#SBATCH --gpus=h100-96:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
-#SBATCH --time=48:00:00
+#SBATCH --time=24:00:00
 #SBATCH --partition=gpu-long
 
 set -euo pipefail
@@ -47,13 +46,15 @@ DECODER_FFN_DIM=4096
 TOKENS_PER_SAMPLE=512
 ENCODER_PREFIX_FRACTION=0.5
 
+# ---- Seed (encoded in checkpoint / probe paths for reproducibility) --------
+SEED=999
+
 # ---- Phase 1: Base LM training ---------------------------------------------
 LM_MAX_TOKENS=16384
 LM_UPDATE_FREQ=1
-LM_MAX_UPDATES=30000
-LM_VALIDATE_EVERY=1000
-LM_WARMUP=4000
-LM_PATIENCE=5
+LM_MAX_UPDATES=40000
+LM_VALIDATE_EVERY=2000
+LM_WARMUP=10000
 
 # ---- Phase 2: Probe training -----------------------------------------------
 PROBE_MAX_UPDATES=5000
@@ -79,7 +80,7 @@ EVAL_LENGTHS=(512 1024 2048)
 # Conditions from experiment_instruction_refined.md + baselines:
 CONDITIONS=(
     "pos_8B|no|B,B,B,B,B,B,B,B|"
-    "rope_8B|yes|B,B,B,B,B,B,B,B|--rotary-embedding"  # uncomment after verifying cluster has latest code
+    "rope_8B|yes|B,B,B,B,B,B,B,B|--rotary-embedding"
     "nopos_8B|yes|B,B,B,B,B,B,B,B|"
     "nopos_8C|yes|C,C,C,C,C,C,C,C|"
     "nopos_4F4C|yes|F,F,F,F,C,C,C,C|"
@@ -167,7 +168,7 @@ echo "      Python: $("${PY}" --version)  at ${PY}"
 CURRENT_STAGE="Step 2 -- dependency installation (torch / fairseq)"
 echo "[2/7] Installing dependencies ..."
 
-"${PY}" -m pip install --force-reinstall "torch>=2.7.0" \
+"${PY}" -m pip install "torch>=2.5.0" \
     --index-url "https://download.pytorch.org/whl/${TORCH_CU}"
 "${PY}" -c "
 import torch
@@ -183,10 +184,10 @@ else:
 "${PY}" -m pip install -q numpy datasets
 
 cd "${REPO_DIR}"
+mv pyproject.toml pyproject.toml.bak
 echo "      Pulling latest code ..."
 git checkout master 2>/dev/null || true
 git pull --ff-only || echo "WARNING: git pull failed -- continuing with local code"
-mv pyproject.toml pyproject.toml.bak
 "${PY}" -m pip install -q -e . --no-build-isolation
 mv pyproject.toml.bak pyproject.toml
 
@@ -246,8 +247,8 @@ echo "[4/7] Training base language models ..."
 for cond_str in "${CONDITIONS[@]}"; do
     IFS='|' read -r COND_NAME NOPOS_FLAG ENCODER_MASK COND_EXTRA <<< "${cond_str}"
 
-    SAVE_DIR="${CHECKPOINTS_ROOT}/${COND_NAME}"
-    CHECKPOINT="${SAVE_DIR}/checkpoint_best.pt"
+    SAVE_DIR="${CHECKPOINTS_ROOT}/${COND_NAME}_seed${SEED}"
+    CHECKPOINT="${SAVE_DIR}/checkpoint_last.pt"
 
     # Skip if checkpoint already exists
     if [ -f "${CHECKPOINT}" ]; then
@@ -258,61 +259,67 @@ for cond_str in "${CONDITIONS[@]}"; do
     echo "      [${COND_NAME}] Training enc-dec LM (nopos=${NOPOS_FLAG}, encoder_mask=${ENCODER_MASK:-default}) ..."
     mkdir -p "${SAVE_DIR}"
 
-    # Build optional flags
-    EXTRA_FLAGS=""
+    # Build args as an array so every flag is a distinct shell word
+    # (unquoted string concatenation can silently swallow trailing flags)
+    TRAIN_ARGS=(
+        "${DATABIN}"
+        --task                          encoder_decoder_language_modeling
+        --sample-break-mode             none
+        --tokens-per-sample             "${TOKENS_PER_SAMPLE}"
+        --encoder-prefix-fraction       "${ENCODER_PREFIX_FRACTION}"
+        --arch                          transformer
+        --encoder-layers                "${ENCODER_LAYERS}"
+        --decoder-layers                "${DECODER_LAYERS}"
+        --encoder-attention-heads       "${ENCODER_HEADS}"
+        --decoder-attention-heads       "${DECODER_HEADS}"
+        --encoder-embed-dim             "${ENCODER_EMBED_DIM}"
+        --decoder-embed-dim             "${DECODER_EMBED_DIM}"
+        --encoder-ffn-embed-dim         "${ENCODER_FFN_DIM}"
+        --decoder-ffn-embed-dim         "${DECODER_FFN_DIM}"
+        --share-all-embeddings
+        --dropout                       0.3
+        --attention-dropout             0.1
+        --optimizer                     adam
+        --adam-betas                    "(0.9, 0.98)"
+        --weight-decay                  0.01
+        --clip-norm                     1.0
+        --lr                            7e-5
+        --lr-scheduler                  inverse_sqrt
+        --warmup-updates                "${LM_WARMUP}"
+        --criterion                     cross_entropy
+        --max-tokens                    "${LM_MAX_TOKENS}"
+        --update-freq                   "${LM_UPDATE_FREQ}"
+        --max-update                    "${LM_MAX_UPDATES}"
+        --skip-invalid-size-inputs-valid-test
+        --required-batch-size-multiple  1
+        --validate-interval-updates     "${LM_VALIDATE_EVERY}"
+        --fp16
+        --save-dir                      "${SAVE_DIR}"
+        --save-interval-updates         "${LM_MAX_UPDATES}"
+        --keep-last-epochs              1
+        --no-epoch-checkpoints
+        --log-interval                  100
+        --log-format                    json
+        --num-workers                   4
+        --seed                          "${SEED}"
+    )
+
+    # Append optional flags as individual array elements
     if [ "${NOPOS_FLAG}" = "yes" ]; then
-        EXTRA_FLAGS="${EXTRA_FLAGS} --no-token-positional-embeddings"
+        TRAIN_ARGS+=(--no-token-positional-embeddings)
     fi
     if [ -n "${ENCODER_MASK}" ]; then
-        EXTRA_FLAGS="${EXTRA_FLAGS} --encoder-head-mask-spec ${ENCODER_MASK}"
+        TRAIN_ARGS+=(--encoder-head-mask-spec "${ENCODER_MASK}")
     fi
     if [ -n "${COND_EXTRA}" ]; then
-        EXTRA_FLAGS="${EXTRA_FLAGS} ${COND_EXTRA}"
+        # shellcheck disable=SC2206
+        TRAIN_ARGS+=(${COND_EXTRA})
     fi
 
-    "${PY}" -m fairseq_cli.train "${DATABIN}" \
-        --task                          encoder_decoder_language_modeling \
-        --sample-break-mode             none \
-        --tokens-per-sample             "${TOKENS_PER_SAMPLE}" \
-        --encoder-prefix-fraction       "${ENCODER_PREFIX_FRACTION}" \
-        --arch                          transformer \
-        --encoder-layers                "${ENCODER_LAYERS}" \
-        --decoder-layers                "${DECODER_LAYERS}" \
-        --encoder-attention-heads       "${ENCODER_HEADS}" \
-        --decoder-attention-heads       "${DECODER_HEADS}" \
-        --encoder-embed-dim             "${ENCODER_EMBED_DIM}" \
-        --decoder-embed-dim             "${DECODER_EMBED_DIM}" \
-        --encoder-ffn-embed-dim         "${ENCODER_FFN_DIM}" \
-        --decoder-ffn-embed-dim         "${DECODER_FFN_DIM}" \
-        --share-all-embeddings \
-        --dropout                       0.3 \
-        --attention-dropout             0.1 \
-        --optimizer                     adam \
-        --adam-betas                    "(0.9, 0.98)" \
-        --weight-decay                  0.01 \
-        --clip-norm                     1.0 \
-        --lr                            1e-4 \
-        --lr-scheduler                  inverse_sqrt \
-        --warmup-updates                "${LM_WARMUP}" \
-        --criterion                     cross_entropy \
-        --max-tokens                    "${LM_MAX_TOKENS}" \
-        --update-freq                   "${LM_UPDATE_FREQ}" \
-        --max-update                    "${LM_MAX_UPDATES}" \
-        --skip-invalid-size-inputs-valid-test \
-        --required-batch-size-multiple  1 \
-        --validate-interval-updates     "${LM_VALIDATE_EVERY}" \
-        --fp16 \
-        --save-dir                      "${SAVE_DIR}" \
-        --save-interval-updates         5000 \
-        --keep-best-checkpoints         1 \
-        --best-checkpoint-metric        loss \
-        --patience                      "${LM_PATIENCE}" \
-        --no-epoch-checkpoints \
-        --log-interval                  100 \
-        --log-format                    json \
-        --num-workers                   4 \
-        --seed                          1 \
-        ${EXTRA_FLAGS}
+    # Echo resolved command so seed is auditable in the .out file
+    printf '      %s\n' "python -m fairseq_cli.train ${TRAIN_ARGS[*]}"
+
+    "${PY}" -m fairseq_cli.train "${TRAIN_ARGS[@]}"
 
     echo "      [${COND_NAME}] Base LM training complete. Checkpoint: ${CHECKPOINT}"
 done
@@ -329,14 +336,14 @@ for EVAL_LEN in "${EVAL_LENGTHS[@]}"; do
     for cond_str in "${CONDITIONS[@]}"; do
         IFS='|' read -r COND_NAME NOPOS_FLAG ENCODER_MASK COND_EXTRA <<< "${cond_str}"
 
-        CHECKPOINT="${CHECKPOINTS_ROOT}/${COND_NAME}/checkpoint_best.pt"
+        CHECKPOINT="${CHECKPOINTS_ROOT}/${COND_NAME}_seed${SEED}/checkpoint_last.pt"
         if [ ! -f "${CHECKPOINT}" ]; then
             echo "      [${COND_NAME}] WARNING: checkpoint not found -- skipping."
             continue
         fi
 
         for LAYER_IDX in "${PROBE_LAYERS[@]}"; do
-            PROBE_TAG="${COND_NAME}_layer${LAYER_IDX}_len${EVAL_LEN}"
+            PROBE_TAG="${COND_NAME}_seed${SEED}_layer${LAYER_IDX}_len${EVAL_LEN}"
             PROBE_OUT="${PROBE_RESULTS}/${PROBE_TAG}.json"
 
             if [ -f "${PROBE_OUT}" ]; then
@@ -375,14 +382,61 @@ for EVAL_LEN in "${EVAL_LENGTHS[@]}"; do
     for cond_str in "${CONDITIONS[@]}"; do
         IFS='|' read -r COND_NAME NOPOS_FLAG ENCODER_MASK COND_EXTRA <<< "${cond_str}"
 
-        CHECKPOINT="${CHECKPOINTS_ROOT}/${COND_NAME}/checkpoint_best.pt"
+        CHECKPOINT="${CHECKPOINTS_ROOT}/${COND_NAME}_seed${SEED}/checkpoint_last.pt"
         if [ ! -f "${CHECKPOINT}" ]; then
             echo "      [${COND_NAME}] WARNING: checkpoint not found -- skipping."
             continue
         fi
 
         for LAYER_IDX in "${PROBE_LAYERS[@]}"; do
-            PROBE_TAG="${COND_NAME}_layer${LAYER_IDX}_len${EVAL_LEN}"
+            PROBE_TAG="${COND_NAME}_seed${SEED}_layer${LAYER_IDX}_len${EVAL_LEN}"
+            REL_OUT="${REL_PROBE_RESULTS}/${PROBE_TAG}.json"
+
+            if [ -f "${REL_OUT}" ]; then
+                echo "      [${PROBE_TAG}] Result exists -- skipping."
+                continue
+            fi
+
+            echo "      [${PROBE_TAG}] Training relative position probe ..."
+
+            "${PY}" "${REPO_DIR}/nopos_experiments/encdec_future_mask/run_relative_position_probe.py" \
+                --checkpoint            "${CHECKPOINT}" \
+                --data                  "${DATABIN}" \
+                --split                 valid \
+                --train-split           train \
+                --probe-layer           "${LAYER_IDX}" \
+                --probe-updates         "${PROBE_MAX_UPDATES}" \
+                --lr                    "${PROBE_LR}" \
+                --max-tokens            "${PROBE_MAX_TOKENS}" \
+                --num-rel-classes       "${REL_PROBE_NUM_CLASSES}" \
+                --pairs-per-seq         "${REL_PROBE_PAIRS_PER_SEQ}" \
+                --eval-tokens-per-sample "${EVAL_LEN}" \
+                --output                "${REL_OUT}"
+
+            echo "      [${PROBE_TAG}] Done."
+        done
+    done
+done
+# =============================================================================
+# Step 6: Relative position probes (condition x layer x eval_length)
+# =============================================================================
+CURRENT_STAGE="Step 6 -- relative position probing"
+echo "[6/7] Running relative position probes ..."
+
+mkdir -p "${REL_PROBE_RESULTS}"
+
+for EVAL_LEN in "${EVAL_LENGTHS[@]}"; do
+    for cond_str in "${CONDITIONS[@]}"; do
+        IFS='|' read -r COND_NAME NOPOS_FLAG ENCODER_MASK COND_EXTRA <<< "${cond_str}"
+
+        CHECKPOINT="${CHECKPOINTS_ROOT}/${COND_NAME}_seed${SEED}/checkpoint_best.pt"
+        if [ ! -f "${CHECKPOINT}" ]; then
+            echo "      [${COND_NAME}] WARNING: checkpoint not found -- skipping."
+            continue
+        fi
+
+        for LAYER_IDX in "${PROBE_LAYERS[@]}"; do
+            PROBE_TAG="${COND_NAME}_seed${SEED}_layer${LAYER_IDX}_len${EVAL_LEN}"
             REL_OUT="${REL_PROBE_RESULTS}/${PROBE_TAG}.json"
 
             if [ -f "${REL_OUT}" ]; then
@@ -423,14 +477,14 @@ for EVAL_LEN in "${EVAL_LENGTHS[@]}"; do
     for cond_str in "${CONDITIONS[@]}"; do
         IFS='|' read -r COND_NAME NOPOS_FLAG ENCODER_MASK COND_EXTRA <<< "${cond_str}"
 
-        CHECKPOINT="${CHECKPOINTS_ROOT}/${COND_NAME}/checkpoint_best.pt"
+        CHECKPOINT="${CHECKPOINTS_ROOT}/${COND_NAME}_seed${SEED}/checkpoint_best.pt"
         if [ ! -f "${CHECKPOINT}" ]; then
             echo "      [${COND_NAME}] WARNING: checkpoint not found -- skipping."
             continue
         fi
 
         for LAYER_IDX in "${PROBE_LAYERS[@]}"; do
-            PROBE_TAG="${COND_NAME}_layer${LAYER_IDX}_len${EVAL_LEN}"
+            PROBE_TAG="${COND_NAME}_seed${SEED}_layer${LAYER_IDX}_len${EVAL_LEN}"
             REG_REL_OUT="${REG_REL_PROBE_RESULTS}/${PROBE_TAG}.json"
 
             if [ -f "${REG_REL_OUT}" ]; then
@@ -480,7 +534,7 @@ for EVAL_LEN in "${EVAL_LENGTHS[@]}"; do
         IFS='|' read -r COND_NAME NOPOS_FLAG ENCODER_MASK COND_EXTRA <<< "${cond_str}"
 
         for LAYER_IDX in "${PROBE_LAYERS[@]}"; do
-            PROBE_TAG="${COND_NAME}_layer${LAYER_IDX}_len${EVAL_LEN}"
+            PROBE_TAG="${COND_NAME}_seed${SEED}_layer${LAYER_IDX}_len${EVAL_LEN}"
 
             ABS_OUT="${PROBE_RESULTS}/${PROBE_TAG}.json"
             REL_OUT="${REL_PROBE_RESULTS}/${PROBE_TAG}.json"
