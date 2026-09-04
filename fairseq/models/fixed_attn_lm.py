@@ -11,6 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+from fairseq import checkpoint_utils
 from fairseq.models import register_model, register_model_architecture
 from fairseq.models.transformer import Embedding, TransformerDecoder
 from fairseq.models.transformer_lm import (
@@ -25,6 +26,12 @@ DEFAULT_MAX_TARGET_POSITIONS = 1024
 
 @dataclass
 class FixedAttnLanguageModelConfig(TransformerLanguageModelConfig):
+    pretrained_decoder_filename: str = field(
+        default="",
+        metadata={
+            "help": "if not empty load the decoder weights from the given checkpoint filename"
+        },
+    )
     probe_layer_idx: int = field(
         default=-1,
         metadata={"help": "decoder layer index whose hidden states to probe (-1 = last)"},
@@ -55,6 +62,9 @@ class FixedAttnLanguageModel(TransformerLanguageModel):
     def forward(self, src_tokens, **kwargs):
         self.decoder.eval()
         with torch.no_grad():
+            # features_only=True skips the full-vocab output projection, which we
+            # never read -- only ``inner_states`` is probed.
+            kwargs.setdefault("features_only", True)
             decoder_out = super().forward(src_tokens, **kwargs)
 
         x = decoder_out[1]["inner_states"][self.probe_layer_idx].transpose(0, 1)
@@ -83,16 +93,37 @@ class FixedAttnLanguageModel(TransformerLanguageModel):
             no_encoder_attn=True, output_projection=None,
         )
 
-        # ---- Fix Q/K/V to all-ones and freeze ----
+        # ---- Load pretrained decoder weights (before pinning Q/K/V) ----
+        pretrained = safe_getattr(args, "pretrained_decoder_filename", "")
+        if pretrained:
+            state = checkpoint_utils.load_checkpoint_to_cpu(
+                pretrained, load_on_all_ranks=True
+            )
+            # Checkpoints saved by a FairseqLanguageModel prefix every key with
+            # "decoder."; strip it so the keys line up with TransformerDecoder.
+            layers_to_delete = []
+            for layer_name in state["model"].copy():
+                if layer_name.startswith("decoder."):
+                    state["model"][layer_name[len("decoder."):]] = state["model"][
+                        layer_name
+                    ]
+                    layers_to_delete.append(layer_name)
+            for layer_name in layers_to_delete:
+                del state["model"][layer_name]
+
+            decoder.load_state_dict(state["model"], strict=True)
+
+        # ---- Freeze the whole decoder; only the probe is trained ----
+        for p in decoder.parameters():
+            p.requires_grad_(False)
+
+        # ---- Fix Q/K/V to all-ones ----
         for layer in decoder.layers:
             for proj_name in ("q_proj", "k_proj", "v_proj"):
                 proj = getattr(layer.self_attn, proj_name)
                 proj.weight.data.fill_(1.0)
                 if proj.bias is not None:
                     proj.bias.data.fill_(0.0)
-                proj.weight.requires_grad = False
-                if proj.bias is not None:
-                    proj.bias.requires_grad = False
 
         # ---- Build probe layers ----
         num_positions = args.tokens_per_sample + decoder.dictionary.nspecial + 1
@@ -132,3 +163,22 @@ def fixed_attn_probe(args):
     args.dropout = safe_getattr(args, "dropout", 0.0)
     args.attention_dropout = safe_getattr(args, "attention_dropout", 0.0)
     base_lm_architecture(args)
+
+
+@register_model_architecture("transformer_lm", "fixed_attn_base_lm")
+def fixed_attn_base_lm(args):
+    """Stage-A base LM whose checkpoint ``fixed_attn_probe`` loads.
+
+    Deliberately reuses ``fixed_attn_probe``'s config function verbatim. The probe
+    loads this checkpoint with ``strict=True``, but the settings that matter most
+    here do not change the key set -- ``decoder_normalize_before`` in particular
+    swaps pre-norm for post-norm using the very same parameter names. A drift
+    would therefore load cleanly and silently evaluate a different function than
+    the one that was trained. Sharing the config function makes that impossible.
+
+    Note this is why ``--arch transformer_lm`` must NOT be used for stage A:
+    ``register_model`` auto-registers a *no-op* arch function under the bare model
+    name, so ``base_lm_architecture`` never runs and ``decoder_normalize_before``
+    would stay at its dataclass default of False.
+    """
+    fixed_attn_probe(args)

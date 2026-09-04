@@ -44,6 +44,15 @@ TOKENS_PER_SAMPLE=512
 # ---- Seed (encoded in paths for reproducibility) ---------------------------
 SEED=999
 
+# ---- Stage A: base LM training ---------------------------------------------
+# The probe reads a *pretrained* decoder, so we first train a plain NoPos LM
+# with exactly the architecture `fixed_attn_probe` rebuilds (the probe loads it
+# with strict=True, so every arch flag below must match the probe's).
+# This stage is the long pole of the job.
+BASE_MAX_UPDATES=20000
+BASE_MAX_TOKENS=8192
+BASE_LR=5e-4
+
 # ---- Probe training --------------------------------------------------------
 PROBE_MAX_UPDATES=5000
 PROBE_LR=5e-3
@@ -57,11 +66,15 @@ PROBE_VALIDATE_EVERY=500
 #
 # causal    = default causal self-attention mask (position encoded by
 #             cumulative average over causally-visible tokens)
-# nocausal  = bidirectional mask (all positions see all tokens, so each
-#             position gets the same global average -- no positional signal)
+#
+# NOTE: a "nocausal" (bidirectional-mask) arm is NOT available yet. The per-head
+# mask spec lives on the nested EncDecBaseConfig, not on the flat
+# TransformerLanguageModelConfig that fixed_attn_lm extends, so
+# `--decoder-head-mask-spec B` is rejected by argparse. Adding it needs a
+# `maskconfig` field on FixedAttnLanguageModelConfig, mirroring
+# transformer_lm_position_probe.py.
 CONDITIONS=(
     "causal|"
-    "nocausal|--decoder-head-mask-spec B"
 )
 
 # ---- Sequence lengths to evaluate ------------------------------------------
@@ -77,6 +90,8 @@ DATA_RAW="${REPO_DIR}/wt103-raw/wikitext-103"
 DATABIN="${REPO_DIR}/data-bin/wikitext-103"
 CHECKPOINTS_ROOT="${REPO_DIR}/checkpoints_fixed_attn"
 RESULTS_DIR="${REPO_DIR}/fixed_attn_probe_results"
+BASE_LM_DIR="${CHECKPOINTS_ROOT}/base_lm_seed${SEED}"
+BASE_CKPT="${BASE_LM_DIR}/checkpoint_last.pt"
 
 echo "======================================================"
 echo "  Fixed-Attention Causal Probe Experiment"
@@ -119,13 +134,13 @@ CURRENT_STAGE="Step 1 -- Miniconda / Python 3.10 setup"
 MINICONDA_DIR="${HOME}/miniconda3"
 
 if [ ! -d "${MINICONDA_DIR}" ]; then
-    echo "[1/4] Miniconda not found -- installing into ${MINICONDA_DIR} ..."
+    echo "[1/5] Miniconda not found -- installing into ${MINICONDA_DIR} ..."
     wget -q https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh \
          -O /tmp/miniconda_install.sh
     bash /tmp/miniconda_install.sh -b -p "${MINICONDA_DIR}"
     rm /tmp/miniconda_install.sh
 else
-    echo "[1/4] Miniconda already present at ${MINICONDA_DIR}."
+    echo "[1/5] Miniconda already present at ${MINICONDA_DIR}."
 fi
 
 source "${MINICONDA_DIR}/etc/profile.d/conda.sh"
@@ -148,7 +163,7 @@ echo "      Python: $("${PY}" --version)  at ${PY}"
 # Step 2: Install dependencies
 # =============================================================================
 CURRENT_STAGE="Step 2 -- dependency installation (torch / fairseq)"
-echo "[2/4] Installing dependencies ..."
+echo "[2/5] Installing dependencies ..."
 
 "${PY}" -m pip install "torch>=2.5.0" \
     --index-url "https://download.pytorch.org/whl/${TORCH_CU}"
@@ -179,7 +194,7 @@ mv pyproject.toml.bak pyproject.toml
 # Step 3: Download & preprocess WikiText-103
 # =============================================================================
 CURRENT_STAGE="Step 3 -- WikiText-103 download / preprocessing"
-echo "[3/4] Preparing WikiText-103 data ..."
+echo "[3/5] Preparing WikiText-103 data ..."
 
 if [ -d "${DATABIN}" ] && [ -n "$(ls -A "${DATABIN}" 2>/dev/null)" ]; then
     echo "      Preprocessed data already present -- skipping."
@@ -220,14 +235,73 @@ PYEOF
     echo "      Preprocessing done."
 fi
 
-# =============================================================================
-# Step 4: Train position probes (layer x eval_length)
-# =============================================================================
-CURRENT_STAGE="Step 4 -- fixed-attention position probing"
-echo "[4/4] Training fixed-attention position probes ..."
-
 mkdir -p "${CHECKPOINTS_ROOT}"
 mkdir -p "${RESULTS_DIR}"
+
+# =============================================================================
+# Step 4: Train the base NoPos LM that the probe reads
+# =============================================================================
+CURRENT_STAGE="Step 4 -- base LM training"
+
+if [ -f "${BASE_CKPT}" ]; then
+    echo "[4/5] Base LM checkpoint already present -- skipping."
+    echo "      ${BASE_CKPT}"
+else
+    echo "[4/5] Training base NoPos LM ..."
+    mkdir -p "${BASE_LM_DIR}"
+
+    # fixed_attn_base_lm is a plain transformer_lm that shares fixed_attn_probe's
+    # arch config function, so the two decoders cannot drift -- the probe loads
+    # this checkpoint with strict=True. Do NOT swap in --arch transformer_lm: its
+    # auto-registered arch function is a no-op, so base_lm_architecture would not
+    # run and the LM would silently be post-norm while the probe is pre-norm.
+    # Do not add --share-decoder-input-output-embed either (changes the key set).
+    "${PY}" -m fairseq_cli.train "${DATABIN}" \
+        --task                          language_modeling \
+        --arch                          fixed_attn_base_lm \
+        --criterion                     cross_entropy \
+        --sample-break-mode             none \
+        --tokens-per-sample             "${TOKENS_PER_SAMPLE}" \
+        --decoder-layers                "${DECODER_LAYERS}" \
+        --decoder-attention-heads       "${DECODER_HEADS}" \
+        --decoder-embed-dim             "${DECODER_EMBED_DIM}" \
+        --decoder-ffn-embed-dim         "${DECODER_FFN_DIM}" \
+        --no-token-positional-embeddings \
+        --dropout                       0.1 \
+        --attention-dropout             0.0 \
+        --optimizer                     adam \
+        --adam-betas                    "(0.9, 0.98)" \
+        --weight-decay                  0.0 \
+        --clip-norm                     1.0 \
+        --lr                            "${BASE_LR}" \
+        --lr-scheduler                  inverse_sqrt \
+        --warmup-updates                4000 \
+        --max-tokens                    "${BASE_MAX_TOKENS}" \
+        --max-update                    "${BASE_MAX_UPDATES}" \
+        --skip-invalid-size-inputs-valid-test \
+        --fp16 \
+        --save-dir                      "${BASE_LM_DIR}" \
+        --save-interval-updates         "${BASE_MAX_UPDATES}" \
+        --keep-last-epochs              1 \
+        --no-epoch-checkpoints \
+        --log-interval                  100 \
+        --log-format                    json \
+        --num-workers                   4 \
+        --seed                          "${SEED}"
+
+    echo "      Base LM training done -- ${BASE_CKPT}"
+fi
+
+if [ ! -f "${BASE_CKPT}" ]; then
+    echo "FATAL: base LM checkpoint missing at ${BASE_CKPT}" >&2
+    exit 1
+fi
+
+# =============================================================================
+# Step 5: Train position probes (layer x eval_length)
+# =============================================================================
+CURRENT_STAGE="Step 5 -- fixed-attention position probing"
+echo "[5/5] Training fixed-attention position probes ..."
 
 for cond_str in "${CONDITIONS[@]}"; do
     IFS='|' read -r COND_NAME COND_EXTRA <<< "${cond_str}"
@@ -251,9 +325,10 @@ for cond_str in "${CONDITIONS[@]}"; do
                 "${DATABIN}"
                 --task                          language_modeling_position_probe
                 --arch                          fixed_attn_probe
-                --criterion                     dpp_cross_entropy_2
+                --criterion                     dpp_cross_entropy_fix
                 --tokens-per-sample             "${EVAL_LEN}"
                 --probe-layer-idx               "${LAYER_IDX}"
+                --pretrained-decoder-filename   "${BASE_CKPT}"
                 --decoder-layers                "${DECODER_LAYERS}"
                 --decoder-attention-heads       "${DECODER_HEADS}"
                 --decoder-embed-dim             "${DECODER_EMBED_DIM}"
@@ -289,10 +364,12 @@ for cond_str in "${CONDITIONS[@]}"; do
                 TRAIN_ARGS+=(${COND_EXTRA})
             fi
 
+            TRAIN_LOG="${SAVE_DIR}/train.log"
             printf '      %s\n' "python -m fairseq_cli.train ${TRAIN_ARGS[*]}"
-            "${PY}" -m fairseq_cli.train "${TRAIN_ARGS[@]}"
+            # Tee so the summary step can recover accuracy / mad from the JSON log.
+            "${PY}" -m fairseq_cli.train "${TRAIN_ARGS[@]}" 2>&1 | tee "${TRAIN_LOG}"
 
-            # Extract final validation loss from the checkpoint
+            # Extract final validation metrics from the checkpoint + JSON log
             "${PY}" -c "
 import json, os, sys
 
@@ -305,12 +382,35 @@ import torch
 state = torch.load(ckpt_path, map_location='cpu', weights_only=False)
 extra = state.get('extra_state', {})
 val_loss = extra.get('best', float('nan'))
+
+# --log-format json emits one JSON object per line; keep the last 'valid' record,
+# which carries the accuracy and mean-absolute-difference the probe reports.
+accuracy = mad = float('nan')
+try:
+    with open('${TRAIN_LOG}') as f:
+        for line in f:
+            line = line.strip()
+            if not line.startswith('{') or 'valid' not in line:
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if 'valid_accuracy' in rec:
+                accuracy = float(rec['valid_accuracy'])
+            if 'valid_mad' in rec:
+                mad = float(rec['valid_mad'])
+except OSError:
+    pass
+
 result = {
     'condition': '${COND_NAME}',
     'probe_layer': ${LAYER_IDX},
     'eval_length': ${EVAL_LEN},
     'seed': ${SEED},
     'val_loss': val_loss,
+    'accuracy': accuracy,
+    'mad': mad,
     'num_updates': state.get('optimizer_history', [{}])[-1].get('num_updates', -1),
 }
 with open('${RESULT_FILE}', 'w') as f:
@@ -324,20 +424,24 @@ print(f'      Saved ${RESULT_FILE}')
 done
 
 # =============================================================================
-# Step 5: Summarise results
+# Step 6: Summarise results
 # =============================================================================
 CURRENT_STAGE="Summary"
 echo ""
 echo "======================================================"
 echo "  FIXED-ATTENTION PROBE RESULTS"
 echo "======================================================"
+echo ""
+echo "  Loss is in bits. Chance for ${TOKENS_PER_SAMPLE} positions is"
+echo "  log2(${TOKENS_PER_SAMPLE} + 5) bits with accuracy ~0."
+echo "  Layer 0 (embedding, no positional embeddings) MUST sit at chance."
 
 for EVAL_LEN in "${EVAL_LENGTHS[@]}"; do
     echo ""
     echo "--- Eval sequence length: ${EVAL_LEN} ---"
     echo ""
-    printf "%-15s  %5s  %8s  %10s\n" "CONDITION" "LAYER" "VAL_LOSS" "UPDATES"
-    printf "%-15s  %5s  %8s  %10s\n" "---------------" "-----" "--------" "----------"
+    printf "%-15s  %5s  %8s  %8s  %8s  %10s\n" "CONDITION" "LAYER" "VAL_LOSS" "ACC(%)" "MAD" "UPDATES"
+    printf "%-15s  %5s  %8s  %8s  %8s  %10s\n" "---------------" "-----" "--------" "--------" "--------" "----------"
 
     for cond_str in "${CONDITIONS[@]}"; do
         IFS='|' read -r COND_NAME COND_EXTRA <<< "${cond_str}"
@@ -347,13 +451,20 @@ for EVAL_LEN in "${EVAL_LENGTHS[@]}"; do
             RESULT_FILE="${RESULTS_DIR}/${PROBE_TAG}.json"
 
             if [ -f "${RESULT_FILE}" ]; then
-                VAL_LOSS=$("${PY}" -c "import json; d=json.load(open('${RESULT_FILE}')); print(f\"{d['val_loss']:.4f}\")")
-                UPDATES=$("${PY}" -c "import json; d=json.load(open('${RESULT_FILE}')); print(d['num_updates'])")
+                read -r VAL_LOSS ACC MAD UPDATES <<< "$("${PY}" -c "
+import json
+d = json.load(open('${RESULT_FILE}'))
+print(f\"{d['val_loss']:.4f}\",
+      f\"{d.get('accuracy', float('nan')):.3f}\",
+      f\"{d.get('mad', float('nan')):.2f}\",
+      d['num_updates'])
+")"
             else
-                VAL_LOSS="N/A"; UPDATES="N/A"
+                VAL_LOSS="N/A"; ACC="N/A"; MAD="N/A"; UPDATES="N/A"
             fi
 
-            printf "%-15s  %5s  %8s  %10s\n" "${COND_NAME}" "${LAYER_IDX}" "${VAL_LOSS}" "${UPDATES}"
+            printf "%-15s  %5s  %8s  %8s  %8s  %10s\n" \
+                "${COND_NAME}" "${LAYER_IDX}" "${VAL_LOSS}" "${ACC}" "${MAD}" "${UPDATES}"
         done
     done
 done
