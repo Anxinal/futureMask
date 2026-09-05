@@ -126,7 +126,7 @@ def main():
             loss.backward()
             opt.step()
             step += 1
-            if step % 10 == 0:
+            if step % 200 == 0:
                 print(f"probe step {step} loss {loss.item():.4f}", flush=True)
 
     # Eval.

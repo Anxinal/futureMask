@@ -61,7 +61,6 @@ PROBE_MAX_UPDATES=10000
 PROBE_LR=1e-3
 PROBE_MAX_TOKENS=4096
 PROBE_VALIDATE_EVERY=2500
-PROBE_WARMUP=2000
 
 # ---- Phase 2b: Relative position probe -------------------------------------
 REL_PROBE_PAIRS_PER_SEQ=64
@@ -249,7 +248,7 @@ for cond_str in "${CONDITIONS[@]}"; do
     IFS='|' read -r COND_NAME NOPOS_FLAG ENCODER_MASK COND_EXTRA <<< "${cond_str}"
 
     SAVE_DIR="${CHECKPOINTS_ROOT}/${COND_NAME}_seed${SEED}"
-    CHECKPOINT="${SAVE_DIR}/checkpoint_last.pt"
+    CHECKPOINT="${SAVE_DIR}/checkpoint_best.pt"
 
     # Skip if checkpoint already exists
     if [ -f "${CHECKPOINT}" ]; then
@@ -297,9 +296,10 @@ for cond_str in "${CONDITIONS[@]}"; do
         --fp16
         --save-dir                      "${SAVE_DIR}"
         --save-interval-updates         "${LM_MAX_UPDATES}"
-        --keep-last-epochs              1
+        --keep-best-checkpoints         1
+        --best-checkpoint-metric        loss
         --no-epoch-checkpoints
-        --log-interval                  100
+        --log-interval                  2500
         --log-format                    json
         --num-workers                   4
         --seed                          "${SEED}"
@@ -337,7 +337,7 @@ for EVAL_LEN in "${EVAL_LENGTHS[@]}"; do
     for cond_str in "${CONDITIONS[@]}"; do
         IFS='|' read -r COND_NAME NOPOS_FLAG ENCODER_MASK COND_EXTRA <<< "${cond_str}"
 
-        CHECKPOINT="${CHECKPOINTS_ROOT}/${COND_NAME}_seed${SEED}/checkpoint_last.pt"
+        CHECKPOINT="${CHECKPOINTS_ROOT}/${COND_NAME}_seed${SEED}/checkpoint_best.pt"
         if [ ! -f "${CHECKPOINT}" ]; then
             echo "      [${COND_NAME}] WARNING: checkpoint not found -- skipping."
             continue
@@ -364,61 +364,13 @@ for EVAL_LEN in "${EVAL_LENGTHS[@]}"; do
                 --lr                    "${PROBE_LR}" \
                 --max-tokens            "${PROBE_MAX_TOKENS}" \
                 --eval-tokens-per-sample "${EVAL_LEN}" \
-                --output                "${PROBE_OUT}" \
-                --log-interval                  100 \
+                --output                "${PROBE_OUT}"
 
             echo "      [${PROBE_TAG}] Done."
         done
     done
 done
 
-# =============================================================================
-# Step 6: Relative position probes (condition x layer x eval_length)
-# =============================================================================
-CURRENT_STAGE="Step 6 -- relative position probing"
-echo "[6/7] Running relative position probes ..."
-
-mkdir -p "${REL_PROBE_RESULTS}"
-
-for EVAL_LEN in "${EVAL_LENGTHS[@]}"; do
-    for cond_str in "${CONDITIONS[@]}"; do
-        IFS='|' read -r COND_NAME NOPOS_FLAG ENCODER_MASK COND_EXTRA <<< "${cond_str}"
-
-        CHECKPOINT="${CHECKPOINTS_ROOT}/${COND_NAME}_seed${SEED}/checkpoint_last.pt"
-        if [ ! -f "${CHECKPOINT}" ]; then
-            echo "      [${COND_NAME}] WARNING: checkpoint not found -- skipping."
-            continue
-        fi
-
-        for LAYER_IDX in "${PROBE_LAYERS[@]}"; do
-            PROBE_TAG="${COND_NAME}_seed${SEED}_layer${LAYER_IDX}_len${EVAL_LEN}"
-            REL_OUT="${REL_PROBE_RESULTS}/${PROBE_TAG}.json"
-
-            if [ -f "${REL_OUT}" ]; then
-                echo "      [${PROBE_TAG}] Result exists -- skipping."
-                continue
-            fi
-
-            echo "      [${PROBE_TAG}] Training relative position probe ..."
-
-            "${PY}" "${REPO_DIR}/nopos_experiments/encdec_future_mask/run_relative_position_probe.py" \
-                --checkpoint            "${CHECKPOINT}" \
-                --data                  "${DATABIN}" \
-                --split                 valid \
-                --train-split           train \
-                --probe-layer           "${LAYER_IDX}" \
-                --probe-updates         "${PROBE_MAX_UPDATES}" \
-                --lr                    "${PROBE_LR}" \
-                --max-tokens            "${PROBE_MAX_TOKENS}" \
-                --num-rel-classes       "${REL_PROBE_NUM_CLASSES}" \
-                --pairs-per-seq         "${REL_PROBE_PAIRS_PER_SEQ}" \
-                --eval-tokens-per-sample "${EVAL_LEN}" \
-                --output                "${REL_OUT}"
-
-            echo "      [${PROBE_TAG}] Done."
-        done
-    done
-done
 # =============================================================================
 # Step 6: Relative position probes (condition x layer x eval_length)
 # =============================================================================
@@ -459,8 +411,6 @@ for EVAL_LEN in "${EVAL_LENGTHS[@]}"; do
                 --max-tokens            "${PROBE_MAX_TOKENS}" \
                 --num-rel-classes       "${REL_PROBE_NUM_CLASSES}" \
                 --pairs-per-seq         "${REL_PROBE_PAIRS_PER_SEQ}" \
-                --lr-scheduler                  inverse_sqrt \
-                --warmup-updates                "${PROBE_WARMUP}"\
                 --eval-tokens-per-sample "${EVAL_LEN}" \
                 --output                "${REL_OUT}"
 
@@ -506,8 +456,6 @@ for EVAL_LEN in "${EVAL_LENGTHS[@]}"; do
                 --probe-layer           "${LAYER_IDX}" \
                 --probe-updates         "${PROBE_MAX_UPDATES}" \
                 --lr                    "${PROBE_LR}" \
-                --lr-scheduler          inverse_sqrt \
-                --warmup-updates        "${PROBE_WARMUP}"\
                 --max-tokens            "${PROBE_MAX_TOKENS}" \
                 --pairs-per-seq         "${REL_PROBE_PAIRS_PER_SEQ}" \
                 --eval-tokens-per-sample "${EVAL_LEN}" \

@@ -1,6 +1,10 @@
-"""Train a linear probe on a frozen encoder's hidden states to predict
-the signed relative distance between two tokens as a continuous value
-(regression). Reports MAE and directional accuracy on the validation split.
+"""Train an MLP probe on the element-wise product of Q and K vectors from
+a frozen encoder's self-attention to predict the signed relative distance
+between two tokens as a continuous value (regression). Reports MAE and
+directional accuracy on the validation split.
+
+The probe input is  q_i ⊙ k_j  (element-wise product of the query at
+position i and the key at position j).
 
 Usage:
   python run_relative_position_probe_regression.py \
@@ -36,7 +40,14 @@ def _build_iter(task, split, max_tokens):
     return batch_iter
 
 
-def _encoder_hidden(model, sample, layer_idx, device):
+def _encoder_qk(model, sample, layer_idx, device):
+    """Extract Q and K vectors from a specific encoder layer's self-attention.
+
+    Returns:
+        q: [B, T, C] query vectors
+        k: [B, T, C] key vectors
+        not_pad: [B, T] boolean mask of non-pad positions
+    """
     src_tokens = sample["net_input"]["src_tokens"].to(device)
     src_lengths = sample["net_input"]["src_lengths"].to(device)
     with torch.no_grad():
@@ -45,12 +56,29 @@ def _encoder_hidden(model, sample, layer_idx, device):
             src_lengths=src_lengths,
             return_all_hiddens=True,
         )
-    states = encoder_out["encoder_states"]  # list of [T, B, C]
-    h = states[layer_idx]
-    h = h.transpose(0, 1).contiguous()  # [B, T, C]
+    # encoder_states: [embedding_out, layer0_out, layer1_out, ...]
+    # Input to layer L = encoder_states[L]
+    states = encoder_out["encoder_states"]
+
+    num_layers = len(model.encoder.layers)
+    lid = layer_idx if layer_idx >= 0 else num_layers + layer_idx
+    layer = model.encoder.layers[lid]
+
+    x = states[lid]  # [T, B, C] — input to this layer
+
+    # Pre-norm: layer norm is applied before Q/K projections
+    if getattr(layer, "normalize_before", False):
+        x = layer.self_attn_layer_norm(x)
+
+    q = layer.self_attn.q_proj(x)  # [T, B, C]
+    k = layer.self_attn.k_proj(x)  # [T, B, C]
+
+    q = q.transpose(0, 1).contiguous()  # [B, T, C]
+    k = k.transpose(0, 1).contiguous()  # [B, T, C]
+
     pad_idx = _task.source_dictionary.pad()
     not_pad = src_tokens.ne(pad_idx)
-    return h, not_pad
+    return q, k, not_pad
 
 
 def _sample_pairs(not_pad, pairs_per_seq, device):
@@ -166,15 +194,15 @@ def main():
             if step >= args.probe_updates:
                 break
 
-            h, not_pad = _encoder_hidden(model, sample, args.probe_layer, device)
+            q, k, not_pad = _encoder_qk(model, sample, args.probe_layer, device)
             batch_idx, pos_i, pos_j, distances = _sample_pairs(
                 not_pad, args.pairs_per_seq, device
             )
             if batch_idx.numel() == 0:
                 continue
 
-            diff = h[batch_idx, pos_j] - h[batch_idx, pos_i]  # [N, C]
-            pred = probe(diff).squeeze(-1)  # [N]
+            qk = q[batch_idx, pos_i] * k[batch_idx, pos_j]  # [N, C]
+            pred = probe(qk).squeeze(-1)  # [N]
             target = distances.float()
             loss = F.mse_loss(pred, target)
 
@@ -182,7 +210,7 @@ def main():
             loss.backward()
             opt.step()
             step += 1
-            if step % 10 == 0:
+            if step % 200 == 0:
                 print(f"reg_rel_probe step {step} loss {loss.item():.4f}", flush=True)
 
     # ---- Eval ----
@@ -195,15 +223,15 @@ def main():
 
     with torch.no_grad():
         for sample in val_iter:
-            h, not_pad = _encoder_hidden(model, sample, args.probe_layer, device)
+            q, k, not_pad = _encoder_qk(model, sample, args.probe_layer, device)
             batch_idx, pos_i, pos_j, distances = _sample_pairs(
                 not_pad, args.pairs_per_seq, device
             )
             if batch_idx.numel() == 0:
                 continue
 
-            diff = h[batch_idx, pos_j] - h[batch_idx, pos_i]
-            pred_dist = probe(diff).squeeze(-1)  # [N]
+            qk = q[batch_idx, pos_i] * k[batch_idx, pos_j]
+            pred_dist = probe(qk).squeeze(-1)  # [N]
             true_dist = distances.float()
 
             abs_errs.append((pred_dist - true_dist).abs().cpu().numpy())

@@ -285,7 +285,7 @@ else
         --save-interval-updates         "${BASE_MAX_UPDATES}" \
         --keep-last-epochs              1 \
         --no-epoch-checkpoints \
-        --log-interval                  100 \
+        --log-interval                  200 \
         --log-format                    json \
         --num-workers                   4 \
         --seed                          "${SEED}"
