@@ -4,7 +4,10 @@
       "Bash(find /e/WorkSpave_python/nopos/nopos_experiments/future_mask_wiki103/runs -name *.log -type f)",
       "Bash(find /e/WorkSpave_python/nopos -name *.arch -o -name *transformer_lm_wiki103*)",
       "Bash(python3 -m json.tool)",
-      "Bash(python -c \"from fairseq.models.fixed_attn_lm import FixedAttnLanguageModel; print\\(''Model registered:'', ''fixed_attn_lm''\\); print\\(''Architecture:'', ''fixed_attn_probe''\\)\")"
+      "Bash(python -c \"from fairseq.models.fixed_attn_lm import FixedAttnLanguageModel; print\\(''Model registered:'', ''fixed_attn_lm''\\); print\\(''Architecture:'', ''fixed_attn_probe''\\)\")",
+      "Bash(find /e/WorkSpave_python/nopos -type f -name *.md -o -name *.txt -o -name *.pdf)",
+      "Bash(find /e/WorkSpave_python/nopos -maxdepth 2 -name *.md -o -name README* ! -path */.vendor* ! -path */.eggs*)",
+      "Bash(find /e/WorkSpave_python/nopos -name REPORT* -o -name *report* ! -path */.vendor* ! -path */.eggs*)"
     ]
   }
 }

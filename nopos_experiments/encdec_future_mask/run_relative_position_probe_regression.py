@@ -145,7 +145,12 @@ def main():
         prm.requires_grad_(False)
 
     embed_dim = model.encoder.embed_tokens.embedding_dim
-    probe = nn.Linear(embed_dim, 1).to(device)
+    hidden_dim = embed_dim
+    probe = nn.Sequential(
+        nn.Linear(embed_dim, hidden_dim),
+        nn.ReLU(),
+        nn.Linear(hidden_dim, 1),
+    ).to(device)
     opt = torch.optim.Adam(probe.parameters(), lr=args.lr)
 
     # ---- Train ----

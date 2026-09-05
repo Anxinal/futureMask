@@ -29,10 +29,6 @@ class FixedAttnLanguageModelConfig(TransformerLanguageModelConfig):
         default=-1,
         metadata={"help": "decoder layer index whose hidden states to probe (-1 = last)"},
     )
-    non_linear_probe: bool = field(
-        default=False,
-        metadata={"help": "if True, use a 2-layer MLP probe with ReLU instead of linear"},
-    )
 
 
 @register_model("fixed_attn_lm", dataclass=FixedAttnLanguageModelConfig)
@@ -42,15 +38,11 @@ class FixedAttnLanguageModel(TransformerLanguageModel):
     The entire decoder is frozen; only the probe linear layer(s) are trained.
     """
 
-    def __init__(self, decoder, position_probe_layers, probe_layer_idx, non_linear_probe):
+    def __init__(self, decoder, probe, probe_layer_idx):
         super().__init__(decoder)
         self.decoder.eval()
         self.probe_layer_idx = probe_layer_idx
-        self.non_linear_probe = non_linear_probe
-        self.position_probe_layer_0 = position_probe_layers[0]
-        if non_linear_probe:
-            self.position_probe_layer_1 = position_probe_layers[1]
-            self.relu = nn.ReLU()
+        self.probe = probe
 
     def forward(self, src_tokens, **kwargs):
         self.decoder.eval()
@@ -58,9 +50,7 @@ class FixedAttnLanguageModel(TransformerLanguageModel):
             decoder_out = super().forward(src_tokens, **kwargs)
 
         x = decoder_out[1]["inner_states"][self.probe_layer_idx].transpose(0, 1)
-        x = self.position_probe_layer_0(x)
-        if self.non_linear_probe:
-            x = self.position_probe_layer_1(self.relu(x))
+        x = self.probe(x)
 
         return x, decoder_out[1]
 
@@ -94,22 +84,18 @@ class FixedAttnLanguageModel(TransformerLanguageModel):
                 if proj.bias is not None:
                     proj.bias.requires_grad = False
 
-        # ---- Build probe layers ----
-        num_positions = args.tokens_per_sample + decoder.dictionary.nspecial + 1
+        # ---- Build MLP probe ----
+        # Output one class per position (0..tokens_per_sample-1).
+        # Use with criterion "position_probe_ce" which targets raw indices.
+        num_positions = args.tokens_per_sample
 
-        def make_linear(in_f, out_f):
-            m = nn.Linear(in_f, out_f, bias=False)
-            nn.init.xavier_uniform_(m.weight)
-            return m
+        probe = nn.Sequential(
+            nn.Linear(args.decoder_output_dim, num_positions),
+            nn.ReLU(),
+            nn.Linear(num_positions, num_positions),
+        )
 
-        position_probe_layers = []
-        if args.non_linear_probe:
-            position_probe_layers.append(make_linear(args.decoder_output_dim, args.decoder_output_dim * 2))
-            position_probe_layers.append(make_linear(args.decoder_output_dim * 2, num_positions))
-        else:
-            position_probe_layers.append(make_linear(args.decoder_output_dim, num_positions))
-
-        return cls(decoder, position_probe_layers, int(args.probe_layer_idx), args.non_linear_probe)
+        return cls(decoder, probe, int(args.probe_layer_idx))
 
     def get_normalized_probs_scriptable(
         self,

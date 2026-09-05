@@ -61,9 +61,7 @@ PROBE_VALIDATE_EVERY=500
 #             position gets the same global average -- no positional signal)
 CONDITIONS=(
     "causal|"
-    "causal_mlp|--non-linear-probe"
     "nocausal|--decoder-head-mask-spec B"
-    "nocausal_mlp|--decoder-head-mask-spec B --non-linear-probe"
 )
 
 # ---- Sequence lengths to evaluate ------------------------------------------
@@ -253,7 +251,7 @@ for cond_str in "${CONDITIONS[@]}"; do
                 "${DATABIN}"
                 --task                          language_modeling_position_probe
                 --arch                          fixed_attn_probe
-                --criterion                     dpp_cross_entropy_2
+                --criterion                     position_probe_ce
                 --tokens-per-sample             "${EVAL_LEN}"
                 --probe-layer-idx               "${LAYER_IDX}"
                 --decoder-layers                "${DECODER_LAYERS}"

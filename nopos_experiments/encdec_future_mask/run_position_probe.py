@@ -93,7 +93,11 @@ def main():
 
     embed_dim = model.encoder.embed_tokens.embedding_dim
     max_pos = int(getattr(cfg.task, "tokens_per_sample", 256)) + 4
-    probe = nn.Linear(embed_dim, max_pos).to(device)
+    probe = nn.Sequential(
+        nn.Linear(embed_dim, max_pos),
+        nn.ReLU(),
+        nn.Linear(max_pos, max_pos),
+    ).to(device)
     opt = torch.optim.Adam(probe.parameters(), lr=args.lr)
 
     pad_idx = task.source_dictionary.pad()
