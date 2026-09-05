@@ -64,13 +64,10 @@ PROBE_VALIDATE_EVERY=500
 #   NAME        : identifier for result dirs / tags
 #   EXTRA_FLAGS : additional fairseq flags appended to the train command
 #
-# causal    = default causal self-attention mask (position encoded by
+# causal    = standard causal self-attention mask (position encoded by
 #             cumulative average over causally-visible tokens)
-# nocausal  = bidirectional mask (all positions see all tokens, so each
-#             position gets the same global average -- no positional signal)
 CONDITIONS=(
     "causal|"
-    "nocausal|--maskconfig B"
 )
 
 # ---- Sequence lengths to evaluate ------------------------------------------

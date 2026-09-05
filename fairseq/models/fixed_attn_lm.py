@@ -36,16 +36,6 @@ class FixedAttnLanguageModelConfig(TransformerLanguageModelConfig):
         default=-1,
         metadata={"help": "decoder layer index whose hidden states to probe (-1 = last)"},
     )
-    maskconfig: str = field(
-        default="",
-        metadata={
-            "help": (
-                "per-head decoder self-attention mask, one character per head: "
-                "C=causal, F=future-only, B=bidirectional. "
-                "Empty string uses the default causal mask for all heads."
-            )
-        },
-    )
 
 
 @register_model("fixed_attn_lm", dataclass=FixedAttnLanguageModelConfig)
@@ -87,12 +77,6 @@ class FixedAttnLanguageModel(TransformerLanguageModel):
         embed_tokens = cls.build_embedding(
             args, task.source_dictionary, args.decoder_input_dim
         )
-
-        # Propagate maskconfig to decoder.head_mask_spec so the decoder
-        # builds per-head masks in its self-attention.
-        maskconfig = safe_getattr(args, "maskconfig", "")
-        if maskconfig:
-            args.decoder_head_mask_spec = maskconfig
 
         decoder = TransformerDecoder(
             args, task.target_dictionary, embed_tokens,
