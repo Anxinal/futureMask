@@ -75,6 +75,9 @@ PROBE_VALIDATE_EVERY=500
 # transformer_lm_position_probe.py.
 CONDITIONS=(
     "causal|"
+    "causal_mlp|--non-linear-probe"
+    "nocausal|--decoder-head-mask-spec B"
+    "nocausal_mlp|--decoder-head-mask-spec B --non-linear-probe"
 )
 
 # ---- Sequence lengths to evaluate ------------------------------------------

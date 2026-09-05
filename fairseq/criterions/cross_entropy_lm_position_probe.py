@@ -40,11 +40,42 @@ class PPCrossEntropyCriterion(FairseqCriterion):
         sample_size = (
             sample["target"].size(0) if self.sentence_avg else sample["ntokens"]
         )
+
+        # --- Accuracy and MAD ---
+        # compute_loss has set sample['target'] to position class indices
+        logits = net_output[0]                     # (B, T, num_classes)
+        preds = logits.argmax(dim=-1)              # (B, T)
+        target = sample["target"]                  # (B, T)
+
+        n_correct = (preds == target).sum().item()
+        n_total = target.numel()
+
+        # Map predicted class indices back to raw positions for MAD
+        dim = logits.shape[1]
+        num_classes = logits.shape[-1]
+        positions_tensor = t.tensor(
+            self.positions[:dim], device=logits.device, dtype=t.long
+        )
+        class_to_pos = t.full(
+            (num_classes,), -1, dtype=t.long, device=logits.device
+        )
+        class_to_pos[positions_tensor] = t.arange(dim, device=logits.device)
+
+        true_pos = t.arange(dim, device=logits.device).unsqueeze(0).expand_as(preds)
+        pred_pos = class_to_pos[preds]
+        valid = pred_pos >= 0
+        mad_sum = (pred_pos[valid] - true_pos[valid]).abs().float().sum().item()
+        mad_count = int(valid.sum().item())
+
         logging_output = {
             "loss": loss.data,
             "ntokens": sample["ntokens"],
             "nsentences": sample["target"].size(0),
             "sample_size": sample_size,
+            "n_correct": n_correct,
+            "n_total": n_total,
+            "mad_sum": mad_sum,
+            "mad_count": mad_count,
         }
         return loss, sample_size, logging_output
 
@@ -94,6 +125,20 @@ class PPCrossEntropyCriterion(FairseqCriterion):
             metrics.log_derived(
                 "ppl", lambda meters: utils.get_perplexity(meters["loss"].avg)
             )
+
+        # Accuracy
+        n_correct = sum(log.get("n_correct", 0) for log in logging_outputs)
+        n_total = sum(log.get("n_total", 0) for log in logging_outputs)
+        if n_total > 0:
+            metrics.log_scalar(
+                "accuracy", 100.0 * n_correct / n_total, n_total, round=2
+            )
+
+        # Mean Absolute Deviation (predicted position vs true position)
+        mad_sum = sum(log.get("mad_sum", 0) for log in logging_outputs)
+        mad_count = sum(log.get("mad_count", 0) for log in logging_outputs)
+        if mad_count > 0:
+            metrics.log_scalar("mad", mad_sum / mad_count, mad_count, round=3)
 
     @staticmethod
     def logging_outputs_can_be_summed() -> bool:
