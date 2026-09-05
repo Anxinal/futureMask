@@ -87,6 +87,12 @@ class DPPCrossEntropyCriterion(FairseqCriterion):
         return loss, sample_size, logging_output
 
     def compute_loss(self, lprobs, target, reduce=True):
+        # Catch a probe head that is too small for the position labels here, with a
+        # readable message, rather than as an async CUDA device-side assert later.
+        assert int(target.max()) < lprobs.size(-1), (
+            f"position target {int(target.max())} is out of range for a probe head "
+            f"with {lprobs.size(-1)} classes"
+        )
         loss = F.nll_loss(
             lprobs,
             target,
