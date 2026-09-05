@@ -66,16 +66,11 @@ PROBE_VALIDATE_EVERY=500
 #
 # causal    = default causal self-attention mask (position encoded by
 #             cumulative average over causally-visible tokens)
-#
-# NOTE: a "nocausal" (bidirectional-mask) arm is NOT available yet. The per-head
-# mask spec lives on the nested EncDecBaseConfig, not on the flat
-# TransformerLanguageModelConfig that fixed_attn_lm extends, so
-# `--decoder-head-mask-spec B` is rejected by argparse. Adding it needs a
-# `maskconfig` field on FixedAttnLanguageModelConfig, mirroring
-# transformer_lm_position_probe.py.
+# nocausal  = bidirectional mask (all positions see all tokens, so each
+#             position gets the same global average -- no positional signal)
 CONDITIONS=(
     "causal|"
-    "nocausal|--decoder-head-mask-spec B"
+    "nocausal|--maskconfig B"
 )
 
 # ---- Sequence lengths to evaluate ------------------------------------------
