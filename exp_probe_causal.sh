@@ -65,7 +65,7 @@ BASE_LR=5e-4
 
 # ---- Probe training --------------------------------------------------------
 PROBE_MAX_UPDATES=5000
-PROBE_LR=5e-3
+PROBE_LR=1e-3
 PROBE_MAX_TOKENS=4096
 PROBE_VALIDATE_EVERY=500
 
