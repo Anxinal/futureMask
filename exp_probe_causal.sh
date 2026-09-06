@@ -45,9 +45,19 @@ TOKENS_PER_SAMPLE=512
 SEED=999
 
 # ---- Stage A: base LM training ---------------------------------------------
-# The probe reads a *pretrained* decoder, so we first train a plain NoPos LM
-# with exactly the architecture `fixed_attn_probe` rebuilds (the probe loads it
-# with strict=True, so every arch flag below must match the probe's).
+# The probe reads a *pretrained* decoder, so we first train a plain NoPos LM whose
+# Q/K projections are pinned to zero BEFORE the first optimizer step and held fixed
+# throughout. Everything else -- V, out_proj, the FFN, the embeddings -- trains
+# normally, so the network co-adapts to fixed uniform attention instead of learning
+# content-based attention that is then thrown away at probe time.
+#
+# Expect a weak model: an LM restricted to a prefix mean of value vectors, with no
+# positional embeddings, cannot do much. Loss is logged in bits and starts near
+# log2(vocab) ~= 18 for WikiText-103; it should fall steadily but plateau well above
+# a normally-attending LM. Not moving at all would be the bug.
+#
+# Uses `--arch fixed_attn_base_lm`, which shares fixed_attn_probe's arch config
+# function so the two decoders cannot drift (the probe loads this with strict=True).
 # This stage is the long pole of the job.
 BASE_MAX_UPDATES=20000
 BASE_MAX_TOKENS=8192
@@ -64,15 +74,22 @@ PROBE_VALIDATE_EVERY=500
 #   NAME        : identifier for result dirs / tags
 #   EXTRA_FLAGS : additional fairseq flags appended to the train command
 #
-# causal    = default causal self-attention mask (position encoded by
-#             cumulative average over causally-visible tokens)
+# With Q/K pinned to zero every attention logit is 0, so attention is an exact
+# uniform average over whatever the mask leaves visible:
 #
-# NOTE: a "nocausal" (bidirectional-mask) arm is NOT available yet. The per-head
-# mask spec lives on the nested EncDecBaseConfig, not on the flat
-# TransformerLanguageModelConfig that fixed_attn_lm extends, so
-# `--decoder-head-mask-spec B` is rejected by argparse. Adding it needs a
-# `maskconfig` field on FixedAttnLanguageModelConfig, mirroring
-# transformer_lm_position_probe.py.
+# causal    = default causal mask. Position t reads the prefix mean
+#             1/(t+1) * sum_{j<=t} v_j -- that 1/(t+1) is the only
+#             position-dependent quantity in the network, and is the signal
+#             being probed for.
+# nocausal  = bidirectional mask. Every position reads the same global mean, so
+#             hidden states vary only by token identity through the residual and
+#             carry no position. This is the control and should sit at chance.
+# *_mlp     = same masks, 2-layer MLP probe instead of linear. Bounds how much of
+#             the signal is linearly decodable vs. merely present.
+#
+# All four arms share ONE causally-trained base LM; only the probe-time mask and
+# probe type differ. Training a bidirectional base LM would be degenerate -- with
+# next-token targets, position t would attend over token t+1, its own label.
 CONDITIONS=(
     "causal|"
     "causal_mlp|--non-linear-probe"
@@ -253,12 +270,17 @@ else
     echo "[4/5] Training base NoPos LM ..."
     mkdir -p "${BASE_LM_DIR}"
 
-    # fixed_attn_base_lm is a plain transformer_lm that shares fixed_attn_probe's
-    # arch config function, so the two decoders cannot drift -- the probe loads
-    # this checkpoint with strict=True. Do NOT swap in --arch transformer_lm: its
-    # auto-registered arch function is a no-op, so base_lm_architecture would not
-    # run and the LM would silently be post-norm while the probe is pre-norm.
+    # fixed_attn_base_lm pins Q/K to zero before training and shares
+    # fixed_attn_probe's arch config function, so the two decoders cannot drift --
+    # the probe loads this checkpoint with strict=True. Do NOT swap in
+    # --arch transformer_lm (or the bare model name fixed_attn_base): their
+    # auto-registered arch functions are no-ops, so base_lm_architecture would not
+    # run and the LM would be post-norm while the probe is pre-norm. That mismatch
+    # loads cleanly under strict=True, hence the assert in build_model.
     # Do not add --share-decoder-input-output-embed either (changes the key set).
+    #
+    # --attention-dropout MUST stay 0.0: fairseq drops attention probabilities
+    # without renormalising, which would break the exact uniform averaging.
     "${PY}" -m fairseq_cli.train "${DATABIN}" \
         --task                          language_modeling \
         --arch                          fixed_attn_base_lm \

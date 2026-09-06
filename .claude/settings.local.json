@@ -8,7 +8,11 @@
       "Bash(python3 -c \"import torch, fairseq; print\\('torch', torch.__version__\\); print\\('fairseq', fairseq.__version__\\)\")",
       "Bash(bash -n exp_probe_causal.sh)",
       "Bash(python3 -c \"import ast; ast.parse\\(open\\('fairseq/models/fixed_attn_lm.py'\\).read\\(\\)\\); print\\('py OK'\\)\")",
-      "Bash(git --no-pager diff exp_probe_causal.sh)"
+      "Bash(git --no-pager diff exp_probe_causal.sh)",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('fairseq/models/fixed_attn_lm.py'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
+      "Bash(python3 -c ' *)",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('nopos_experiments/verify_fixed_attn.py'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
+      "Bash(git --no-pager diff --stat)"
     ]
   }
 }
