@@ -63,6 +63,15 @@ BASE_MAX_UPDATES=20000
 BASE_MAX_TOKENS=8192
 BASE_LR=5e-4
 
+# ---- Stale-run handling -----------------------------------------------------
+# fairseq auto-resumes from <save-dir>/checkpoint_last.pt. Across code changes
+# that is a trap: a checkpoint written by an older criterion/architecture either
+# aborts the job ("Criterion does not match") or, worse, silently restores stale
+# weights. A run directory without its completion marker is by definition from an
+# incomplete run, so clear it. Set to 0 to keep fairseq's resume-after-preemption
+# behaviour instead.
+FRESH_START=1
+
 # ---- Probe training --------------------------------------------------------
 PROBE_MAX_UPDATES=5000
 PROBE_LR=1e-3
@@ -268,6 +277,13 @@ if [ -f "${BASE_CKPT}" ]; then
     echo "      ${BASE_CKPT}"
 else
     echo "[4/5] Training base NoPos LM ..."
+    # No BASE_CKPT => whatever is in here is a partial or pre-Q/K-pin run. An old
+    # checkpoint would resume cleanly (same criterion, same key set) and hand the
+    # probe a base LM that never trained with the pin.
+    if [ "${FRESH_START}" = "1" ] && [ -d "${BASE_LM_DIR}" ]; then
+        echo "      Clearing stale ${BASE_LM_DIR}"
+        rm -rf "${BASE_LM_DIR}"
+    fi
     mkdir -p "${BASE_LM_DIR}"
 
     # fixed_attn_base_lm pins Q/K to zero before training and shares
@@ -344,6 +360,12 @@ for cond_str in "${CONDITIONS[@]}"; do
             fi
 
             echo "      [${PROBE_TAG}] Training probe ..."
+            # RESULT_FILE is the completion marker; it does not exist here, so any
+            # checkpoint left in SAVE_DIR is from an incomplete or older run.
+            if [ "${FRESH_START}" = "1" ] && [ -d "${SAVE_DIR}" ]; then
+                echo "      Clearing stale ${SAVE_DIR}"
+                rm -rf "${SAVE_DIR}"
+            fi
             mkdir -p "${SAVE_DIR}"
 
             TRAIN_ARGS=(
