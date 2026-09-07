@@ -57,10 +57,10 @@ LM_VALIDATE_EVERY=2000
 LM_WARMUP=10000
 
 # ---- Phase 2: Probe training -----------------------------------------------
-PROBE_MAX_UPDATES=5000
-PROBE_LR=5e-3
-PROBE_MAX_TOKENS=4096
-PROBE_VALIDATE_EVERY=500
+PROBE_MAX_UPDATES=6000
+PROBE_LR=1e-3
+PROBE_MAX_TOKENS=8192
+PROBE_VALIDATE_EVERY=2000
 
 # ---- Phase 2b: Relative position probe -------------------------------------
 REL_PROBE_PAIRS_PER_SEQ=64
