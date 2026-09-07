@@ -84,6 +84,8 @@ CONDITIONS=(
     "nopos_8B|yes|B,B,B,B,B,B,B,B|"
     "nopos_8C|yes|C,C,C,C,C,C,C,C|"
     "nopos_4F4C|yes|F,F,F,F,C,C,C,C|"
+    "pos_4F4C|no|F,F,F,F,C,C,C,C|"
+    "pos_8C|no|C,C,C,C,C,C,C,C|"
   
 )
 
