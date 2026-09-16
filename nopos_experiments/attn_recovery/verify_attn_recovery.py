@@ -23,6 +23,7 @@ Usage:
 """
 
 import argparse
+import math
 import sys
 from argparse import Namespace
 
@@ -119,6 +120,21 @@ def part_a(seq_len=6, dim=8):
     with torch.no_grad():
         out = uniform_attention("C", d)(x, padding_mask=torch.ones(B, T, dtype=torch.bool))
     check("fully masked rows produce no NaN", bool(torch.isfinite(out).all()))
+
+    # Regression test. A future-only head at a padded query position sees nothing but
+    # padding, so its whole row is masked. Blocking with -inf makes softmax return NaN
+    # there; patching the forward value afterwards still leaves a NaN *gradient*, which
+    # wipes out every parameter on the first step. The forward check above passes either
+    # way -- only the backward catches it.
+    attn = FullWidthMaskedAttention(d, "C,F", dropout=0.0)
+    x_grad = x.clone().requires_grad_(True)
+    attn(x_grad, padding_mask=pad).sum().backward()
+    nonfinite = [
+        n for n, p in attn.named_parameters()
+        if p.grad is None or not torch.isfinite(p.grad).all()
+    ]
+    check("gradients stay finite when a row is fully masked", not nonfinite,
+          f"non-finite in: {nonfinite}" if nonfinite else "")
 
     print("\n[A4] the recovery map")
     attn = FullWidthMaskedAttention(d, "C,F")
@@ -225,7 +241,8 @@ def part_b(args):
     opt = torch.optim.Adam(params, lr=1e-3)
 
     losses = []
-    for _ in range(args.steps):
+    nan_step = None
+    for step in range(args.steps):
         out, extra = student(**net_input)
         target = extra["teacher_attn_out"]
         pad = extra["padding_mask"]
@@ -236,12 +253,15 @@ def part_b(args):
         loss.backward()
         opt.step()
         losses.append(loss.item())
+        if nan_step is None and not math.isfinite(losses[-1]):
+            nan_step = step
 
     check("student and teacher outputs have the same shape",
           out.shape == target.shape, f"{tuple(out.shape)}")
     check(f"loss decreased over {args.steps} steps",
-          losses[-1] < losses[0],
-          f"{losses[0]:.5f} -> {losses[-1]:.5f}")
+          nan_step is None and losses[-1] < losses[0],
+          f"{losses[0]:.5f} -> {losses[-1]:.5f}"
+          + (f", first non-finite at step {nan_step}" if nan_step is not None else ""))
     drifted = [
         n for n, p in student.teacher.named_parameters()
         if not torch.equal(p.detach(), before[n])

@@ -142,9 +142,21 @@ class FullWidthMaskedAttention(nn.Module):
     def forward(self, x, padding_mask: Optional[torch.Tensor] = None):
         """x: ``[B, T, C]``; padding_mask: ``[B, T]``, True at padded positions."""
         B, T, C = x.shape
+        # Block with the dtype's most negative *finite* value, not -inf.
+        #
+        # A row can be entirely masked: a future-only head at a padded position sees
+        # nothing but padding. Softmax over an all -inf row is NaN, and cleaning that
+        # up afterwards (torch.nan_to_num) fixes the forward pass but NOT the backward
+        # -- softmax's gradient is computed from its own NaN output, so every parameter
+        # receives NaN on the first step. With a finite floor such a row softmaxes to a
+        # uniform distribution instead: finite, differentiable, and dropped by the
+        # criterion along with every other padded position. Rows that merely have some
+        # keys masked are unaffected, since exp(finfo.min - max) underflows to 0.
+        neg = torch.finfo(x.dtype).min
         head_masks = _build_head_masks(
             self.mask_spec, T, self.future_mask_allow_self
         ).to(device=x.device, dtype=x.dtype)
+        head_masks = head_masks.masked_fill(torch.isinf(head_masks), neg)
 
         outs = []
         for h in range(self.num_heads):
@@ -155,14 +167,10 @@ class FullWidthMaskedAttention(nn.Module):
             logits = torch.bmm(q, k.transpose(1, 2))  # [B, T, T]
             logits = logits + head_masks[h].unsqueeze(0)
             if padding_mask is not None:
-                logits = logits.masked_fill(padding_mask.unsqueeze(1), float("-inf"))
+                logits = logits.masked_fill(padding_mask.unsqueeze(1), neg)
 
             # softmax in fp32 (utils.softmax), then back to the input dtype for fp16.
             attn = utils.softmax(logits, dim=-1).type_as(q)
-            # A row with every key masked softmaxes to NaN. Only padded query rows can
-            # hit this, and the criterion drops them, but NaNs would still poison the
-            # fp16 grad scaler, so zero them here.
-            attn = torch.nan_to_num(attn, nan=0.0)
             attn = self.dropout(attn)
             outs.append(torch.bmm(attn, v))
 
