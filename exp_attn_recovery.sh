@@ -4,7 +4,7 @@
 #SBATCH --error=attnrec_%j.err
 #SBATCH --gpus=a100-80:1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=32G
+#SBATCH --mem=64G
 #SBATCH --time=12:00:00
 #SBATCH --partition=gpu-long
 
@@ -103,10 +103,17 @@ RANDOM_TOKEN_PROB=0.1
 #               Useful for running this locally against an existing install.
 # SMOKE       : 1 = tiny model, ~100 updates -- wiring validation, not a result.
 # RUN_VERIFY  : 1 = run verify_attn_recovery.py after stage A and abort on failure.
+# NUM_WORKERS : DataLoader worker processes. 0 loads in the main process, which
+#               removes the "DataLoader worker exited unexpectedly" failure mode
+#               entirely -- that message means the workers were killed (cgroup memory
+#               limit or a small /dev/shm), not that the data is bad. The dataset is
+#               memory-mapped and the masking is cheap, while the GPU step dominates,
+#               so 0 costs little here. Raise it once the job is known to fit.
 FRESH_START=${FRESH_START:-1}
 SKIP_SETUP=${SKIP_SETUP:-0}
 SMOKE=${SMOKE:-0}
 RUN_VERIFY=${RUN_VERIFY:-1}
+NUM_WORKERS=${NUM_WORKERS:-0}
 
 if [ "${SMOKE}" = "1" ]; then
     echo "### SMOKE MODE: tiny model, ~100 updates. Wiring check only. ###"
@@ -392,7 +399,7 @@ else
         --no-epoch-checkpoints
         --log-interval                  100
         --log-format                    json
-        --num-workers                   4
+        --num-workers                   "${NUM_WORKERS}"
         --seed                          "${SEED}"
     )
 
@@ -486,7 +493,7 @@ for cond_str in "${CONDITIONS[@]}"; do
         --no-save
         --log-interval                  50
         --log-format                    json
-        --num-workers                   4
+        --num-workers                   "${NUM_WORKERS}"
         --seed                          "${SEED}"
     )
 
