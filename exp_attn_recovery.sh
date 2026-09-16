@@ -176,13 +176,10 @@ case "${CUDA_VER:-0}" in
 esac
 echo "PyTorch wheel: ${TORCH_CU}"
 
-# Precision flags: fp16 needs a GPU. A CPU smoke run falls back to fp32.
-if [ "${GPU_OK}" = "1" ]; then
-    PRECISION_ARGS=(--fp16)
-else
-    PRECISION_ARGS=(--cpu)
-    echo "NOTE: running on CPU in fp32."
-fi
+# nvidia-smi only picks the wheel above. Whether to train on GPU is decided from
+# torch itself after installation (Step 2) -- nvidia-smi is missing on some nodes
+# where torch's CUDA works perfectly well, and getting this wrong does not merely
+# run slowly, it crashes: see the note on PRECISION_ARGS there.
 echo "---"
 
 # =============================================================================
@@ -252,6 +249,30 @@ print('CUDA ok  :', torch.cuda.is_available())
 if torch.cuda.is_available():
     print('GPU      :', torch.cuda.get_device_name(0))
 "
+
+# Ask torch -- not nvidia-smi -- whether to use the GPU.
+#
+# This must be authoritative because of a fairseq bug: without apex's fused kernel,
+# clip_grad_norm_ puts the total norm on cuda whenever torch.cuda.is_available()
+# (fairseq/utils.py:373) even when every gradient is on the CPU. Passing --cpu on a
+# machine where torch sees CUDA therefore dies in the first optimizer step with
+# "Expected all tensors to be on the same device ... cuda:0 and cpu". Clearing
+# CUDA_VISIBLE_DEVICES makes torch.cuda.is_available() False, which keeps that code
+# path on the CPU where the gradients are.
+if "${PY}" -c "import torch, sys; sys.exit(0 if torch.cuda.is_available() else 1)"; then
+    GPU_OK=1
+    PRECISION_ARGS=(--fp16)
+    echo "      torch sees CUDA -- training on GPU in fp16."
+else
+    GPU_OK=0
+    PRECISION_ARGS=(--cpu)
+    export CUDA_VISIBLE_DEVICES=""
+    echo "      torch does not see CUDA -- training on CPU in fp32."
+    if [ "${SMOKE}" != "1" ]; then
+        echo "WARNING: a full run on CPU is not viable at these sizes." >&2
+        echo "         Check the GPU allocation (--gpus) before letting this continue." >&2
+    fi
+fi
 # A .py file whose name contains a dot breaks fairseq outright: models/__init__.py
 # auto-imports every file in that directory and turns "transformer.simple.py" into an
 # import of fairseq.models.transformer.simple, which does not exist. An editor holding
