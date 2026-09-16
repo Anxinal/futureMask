@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -m py_compile fairseq/models/simple_attn_recovery.py fairseq/criterions/attn_recovery.py)",
+      "Bash(bash -n exp_attn_recovery.sh)",
+      "Bash(command -v shellcheck)",
+      "Bash(shellcheck -S warning exp_attn_recovery.sh)",
+      "Bash(awk '/ *)",
+      "Bash(rm -f /private/tmp/claude-501/-Users-anxiao-python-nopos/caccc2b2-3f60-4e72-99bb-e36ba55fd376/scratchpad/block*.py)",
+      "Bash(TRAIN_LOG=/private/tmp/claude-501/-Users-anxiao-python-nopos/caccc2b2-3f60-4e72-99bb-e36ba55fd376/scratchpad/fake_train.log RESULT_FILE=/private/tmp/claude-501/-Users-anxiao-python-nopos/caccc2b2-3f60-4e72-99bb-e36ba55fd376/scratchpad/CF_seed1924.json COND=CF SPEC=C,F SEED=1924 UPDATES=100 python3 /private/tmp/claude-501/-Users-anxiao-python-nopos/caccc2b2-3f60-4e72-99bb-e36ba55fd376/scratchpad/block2.py)",
+      "Bash(python3 -c 'import json;d=json.load\\(open\\('\\\\''/private/tmp/claude-501/-Users-anxiao-python-nopos/caccc2b2-3f60-4e72-99bb-e36ba55fd376/scratchpad/CF_seed1924.json'\\\\''\\)\\);print\\('\\\\''num_updates ='\\\\'',d['\\\\''num_updates'\\\\''],'\\\\''| mae ='\\\\'',d['\\\\''mae'\\\\''],'\\\\''| rel_l2 ='\\\\'',d['\\\\''rel_l2'\\\\'']\\)')",
+      "Bash(python3 pilot_recovery.py)"
+    ]
+  }
+}
