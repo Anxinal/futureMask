@@ -68,11 +68,11 @@ TEACHER_WARMUP=4000
 TEACHER_VALIDATE_EVERY=2000
 
 # ---- Stage B: students ------------------------------------------------------
-STUDENT_MAX_UPDATES=5000
+STUDENT_MAX_UPDATES=8000
 STUDENT_MAX_TOKENS=8192
-STUDENT_LR=1e-3
-STUDENT_WARMUP=500
-STUDENT_VALIDATE_EVERY=500
+STUDENT_LR=8e-4
+STUDENT_WARMUP=1000
+STUDENT_VALIDATE_EVERY=1000
 
 # Student embedding table. The student inherits nothing from the teacher: 'random'
 # gives it its own table, freshly initialised and retrained from scratch, so every
