@@ -58,11 +58,11 @@ class trainer:
          self.first = first 
          self.second = second
     def train_first_model(self):
-         # same as training a usual language model with next token prediction task
+         # preferably trained in MLM but if too complicated to implement switch back to wikitext 103 next token prediction
         learning_rate = 1e_4
         data_type = "fp16"
         epochs = 20
-        dataset = "wikitext103"
+        task = "MLM"
         lr_scheduler = "inv-sqrt"
         checkpoints = None # but if it is necessary to save the model for later validation, only save the best 
 

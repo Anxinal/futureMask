@@ -252,6 +252,18 @@ print('CUDA ok  :', torch.cuda.is_available())
 if torch.cuda.is_available():
     print('GPU      :', torch.cuda.get_device_name(0))
 "
+# A .py file whose name contains a dot breaks fairseq outright: models/__init__.py
+# auto-imports every file in that directory and turns "transformer.simple.py" into an
+# import of fairseq.models.transformer.simple, which does not exist. An editor holding
+# such a file open can recreate it after it is removed, so check before blaming CUDA.
+BAD_MODELS="$(find fairseq/models -maxdepth 1 -name '*.*.py' 2>/dev/null || true)"
+if [ -n "${BAD_MODELS}" ]; then
+    echo "FATAL: dotted filename(s) under fairseq/models break 'import fairseq':" >&2
+    echo "${BAD_MODELS}" >&2
+    echo "Move them out of fairseq/models (docs belong in nopos_experiments/)." >&2
+    exit 1
+fi
+
 # Fail early if the new model/criterion did not register.
 "${PY}" -c "
 from fairseq.models import ARCH_MODEL_REGISTRY
