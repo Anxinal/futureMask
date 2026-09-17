@@ -98,6 +98,15 @@ class FixedAttnLanguageModelConfig(TransformerLanguageModelConfig):
         default=False,
         metadata={"help": "if True, use a 2-layer MLP probe with ReLU instead of linear"},
     )
+    probe_target: str = field(
+        default="position",
+        metadata={
+            "help": "what the probe predicts. 'position': classify the absolute position t "
+            "(criterion dpp_cross_entropy_fix). 'reciprocal': regress 1/(t+1), the "
+            "prefix-mean weight that is the only position-dependent quantity under the "
+            "Q/K pin (criterion reciprocal_position_probe)."
+        },
+    )
     decoder_head_mask_spec: str = field(
         default="",
         metadata={
@@ -205,19 +214,33 @@ class FixedAttnLanguageModel(TransformerLanguageModel):
             p.requires_grad_(False)
 
         # ---- Build probe layers ----
-        num_positions = args.tokens_per_sample + decoder.dictionary.nspecial + 1
+        probe_target = safe_getattr(args, "probe_target", "position")
+        assert probe_target in ("position", "reciprocal"), (
+            f"--probe-target must be 'position' or 'reciprocal', got {probe_target!r}"
+        )
+        if probe_target == "reciprocal":
+            # One scalar per token: the predicted 1/(t+1). The output layer gets a bias,
+            # unlike the classification head -- a regression with no intercept would have
+            # to find a constant direction in the residual stream to fit the target's
+            # nonzero mean, and R^2 is not well defined without one.
+            out_dim, out_bias = 1, True
+        else:
+            out_dim = args.tokens_per_sample + decoder.dictionary.nspecial + 1
+            out_bias = False
 
-        def make_linear(in_f, out_f):
-            m = nn.Linear(in_f, out_f, bias=False)
+        def make_linear(in_f, out_f, bias=False):
+            m = nn.Linear(in_f, out_f, bias=bias)
             nn.init.xavier_uniform_(m.weight)
+            if bias:
+                nn.init.constant_(m.bias, 0.0)
             return m
 
         position_probe_layers = []
         if args.non_linear_probe:
             position_probe_layers.append(make_linear(args.decoder_output_dim, args.decoder_output_dim * 2))
-            position_probe_layers.append(make_linear(args.decoder_output_dim * 2, num_positions))
+            position_probe_layers.append(make_linear(args.decoder_output_dim * 2, out_dim, bias=out_bias))
         else:
-            position_probe_layers.append(make_linear(args.decoder_output_dim, num_positions))
+            position_probe_layers.append(make_linear(args.decoder_output_dim, out_dim, bias=out_bias))
 
         return cls(decoder, position_probe_layers, int(args.probe_layer_idx), args.non_linear_probe)
 
@@ -260,6 +283,7 @@ class FixedAttnBaseLanguageModel(TransformerLanguageModel):
 
 @register_model_architecture("fixed_attn_lm", "fixed_attn_probe")
 def fixed_attn_probe(args):
+    args.probe_target = safe_getattr(args, "probe_target", "position")
     args.decoder_layers = safe_getattr(args, "decoder_layers", 2)
     args.decoder_attention_heads = safe_getattr(args, "decoder_attention_heads", 1)
     args.no_token_positional_embeddings = True

@@ -73,10 +73,40 @@ BASE_LR=5e-4
 FRESH_START=1
 
 # ---- Probe training --------------------------------------------------------
-PROBE_MAX_UPDATES=5000
+PROBE_MAX_UPDATES=6000
 PROBE_LR=1e-3
 PROBE_MAX_TOKENS=4096
 PROBE_VALIDATE_EVERY=500
+
+# ---- Probe target -----------------------------------------------------------
+# position   : classify the absolute position t (criterion dpp_cross_entropy_fix).
+# reciprocal : regress c/(t+1) (criterion reciprocal_position_probe). Under the Q/K
+#              pin, 1/(t+1) is the prefix-mean weight -- the only position-dependent
+#              quantity the network computes -- so this asks whether the probe can
+#              read that signal directly, rather than invert it into t.
+#
+# RECIPROCAL_SCALE is c. 0 = T/H_T (H_T the T-th harmonic number), which makes the
+# mean target exactly 1 -- about 75 down to 0.15 at T=512. Unscaled, late targets are
+# ~2e-3 and the MSE ~1e-5. c changes only the loss's units and the optimisation:
+# r2, mad and accuracy are mathematically identical at any c.
+#
+# Read r2 TOGETHER WITH mad. Both the loss and r2 are dominated by early positions:
+# a probe that resolves only t < 10 and guesses a constant afterwards scores
+# r2 ~ 0.96 while being off by ~157 positions on average. mad and accuracy invert
+# the prediction back to a position, and are comparable with the classification
+# probe's numbers.
+#
+# Reciprocal runs are tagged "_recip", so position-probe results keep their
+# original names and are not overwritten or re-run.
+PROBE_TARGET=${PROBE_TARGET:-reciprocal}
+RECIPROCAL_SCALE=${RECIPROCAL_SCALE:-0}
+
+case "${PROBE_TARGET}" in
+    position)   PROBE_CRITERION=dpp_cross_entropy_fix;     TARGET_TAG="" ;;
+    reciprocal) PROBE_CRITERION=reciprocal_position_probe; TARGET_TAG="_recip" ;;
+    *) echo "FATAL: PROBE_TARGET must be 'position' or 'reciprocal', got '${PROBE_TARGET}'" >&2
+       exit 1 ;;
+esac
 
 # ---- Conditions to run ------------------------------------------------------
 # Each condition: NAME|EXTRA_FLAGS
@@ -349,7 +379,7 @@ for cond_str in "${CONDITIONS[@]}"; do
 
     for EVAL_LEN in "${EVAL_LENGTHS[@]}"; do
         for LAYER_IDX in "${PROBE_LAYERS[@]}"; do
-            PROBE_TAG="${COND_NAME}_seed${SEED}_layer${LAYER_IDX}_len${EVAL_LEN}"
+            PROBE_TAG="${COND_NAME}${TARGET_TAG}_seed${SEED}_layer${LAYER_IDX}_len${EVAL_LEN}"
             SAVE_DIR="${CHECKPOINTS_ROOT}/${PROBE_TAG}"
             RESULT_FILE="${RESULTS_DIR}/${PROBE_TAG}.json"
 
@@ -372,7 +402,8 @@ for cond_str in "${CONDITIONS[@]}"; do
                 "${DATABIN}"
                 --task                          language_modeling_position_probe
                 --arch                          fixed_attn_probe
-                --criterion                     dpp_cross_entropy_fix
+                --criterion                     "${PROBE_CRITERION}"
+                --probe-target                  "${PROBE_TARGET}"
                 --tokens-per-sample             "${EVAL_LEN}"
                 --probe-layer-idx               "${LAYER_IDX}"
                 --pretrained-decoder-filename   "${BASE_CKPT}"
@@ -410,6 +441,11 @@ for cond_str in "${CONDITIONS[@]}"; do
                 # shellcheck disable=SC2206
                 TRAIN_ARGS+=(${COND_EXTRA})
             fi
+            # --reciprocal-scale belongs to the reciprocal criterion's config, so
+            # passing it alongside dpp_cross_entropy_fix would be rejected.
+            if [ "${PROBE_TARGET}" = "reciprocal" ]; then
+                TRAIN_ARGS+=(--reciprocal-scale "${RECIPROCAL_SCALE}")
+            fi
 
             TRAIN_LOG="${SAVE_DIR}/train.log"
             printf '      %s\n' "python -m fairseq_cli.train ${TRAIN_ARGS[*]}"
@@ -430,32 +466,39 @@ state = torch.load(ckpt_path, map_location='cpu', weights_only=False)
 extra = state.get('extra_state', {})
 val_loss = extra.get('best', float('nan'))
 
-# --log-format json emits one JSON object per line; keep the last 'valid' record,
-# which carries the accuracy and mean-absolute-difference the probe reports.
-accuracy = mad = float('nan')
+# Keep the last validation record's accuracy / mad (and r2 for the reciprocal probe).
+# fairseq writes these records through the logging module, so each line reads
+#   2026-09-17 10:00:00 | INFO | valid | {\"epoch\": 1, \"valid_mad\": ...}
+# -- the JSON is a suffix, not the whole line. Matching on line.startswith('{')
+# found nothing and silently recorded nan; parse from the first brace instead.
+accuracy = mad = r2 = float('nan')
 try:
     with open('${TRAIN_LOG}') as f:
         for line in f:
-            line = line.strip()
-            if not line.startswith('{') or 'valid' not in line:
+            brace = line.find('{')
+            if brace < 0:
                 continue
             try:
-                rec = json.loads(line)
+                rec = json.loads(line[brace:])
             except ValueError:
                 continue
             if 'valid_accuracy' in rec:
                 accuracy = float(rec['valid_accuracy'])
             if 'valid_mad' in rec:
                 mad = float(rec['valid_mad'])
+            if 'valid_r2' in rec:
+                r2 = float(rec['valid_r2'])
 except OSError:
     pass
 
 result = {
     'condition': '${COND_NAME}',
+    'probe_target': '${PROBE_TARGET}',
     'probe_layer': ${LAYER_IDX},
     'eval_length': ${EVAL_LEN},
     'seed': ${SEED},
     'val_loss': val_loss,
+    'r2': r2,
     'accuracy': accuracy,
     'mad': mad,
     'num_updates': state.get('optimizer_history', [{}])[-1].get('num_updates', -1),
@@ -479,39 +522,47 @@ echo "======================================================"
 echo "  FIXED-ATTENTION PROBE RESULTS"
 echo "======================================================"
 echo ""
-echo "  Loss is in bits. Chance for ${TOKENS_PER_SAMPLE} positions is"
-echo "  log2(${TOKENS_PER_SAMPLE} + 5) bits with accuracy ~0."
+echo "  Probe target: ${PROBE_TARGET}"
+if [ "${PROBE_TARGET}" = "reciprocal" ]; then
+    echo "  VAL_LOSS is the MSE on c/(t+1), in scaled units. Chance is R2 ~ 0."
+    echo "  Read R2 together with MAD: R2 is dominated by early positions and stays"
+    echo "  high for a probe with almost no late-position resolution."
+else
+    echo "  Loss is in bits. Chance for ${TOKENS_PER_SAMPLE} positions is"
+    echo "  log2(${TOKENS_PER_SAMPLE} + 5) bits with accuracy ~0."
+fi
 echo "  Layer 0 (embedding, no positional embeddings) MUST sit at chance."
 
 for EVAL_LEN in "${EVAL_LENGTHS[@]}"; do
     echo ""
     echo "--- Eval sequence length: ${EVAL_LEN} ---"
     echo ""
-    printf "%-15s  %5s  %8s  %8s  %8s  %10s\n" "CONDITION" "LAYER" "VAL_LOSS" "ACC(%)" "MAD" "UPDATES"
-    printf "%-15s  %5s  %8s  %8s  %8s  %10s\n" "---------------" "-----" "--------" "--------" "--------" "----------"
+    printf "%-15s  %5s  %9s  %8s  %8s  %8s  %10s\n" "CONDITION" "LAYER" "VAL_LOSS" "R2" "ACC(%)" "MAD" "UPDATES"
+    printf "%-15s  %5s  %9s  %8s  %8s  %8s  %10s\n" "---------------" "-----" "---------" "--------" "--------" "--------" "----------"
 
     for cond_str in "${CONDITIONS[@]}"; do
         IFS='|' read -r COND_NAME COND_EXTRA <<< "${cond_str}"
 
         for LAYER_IDX in "${PROBE_LAYERS[@]}"; do
-            PROBE_TAG="${COND_NAME}_seed${SEED}_layer${LAYER_IDX}_len${EVAL_LEN}"
+            PROBE_TAG="${COND_NAME}${TARGET_TAG}_seed${SEED}_layer${LAYER_IDX}_len${EVAL_LEN}"
             RESULT_FILE="${RESULTS_DIR}/${PROBE_TAG}.json"
 
             if [ -f "${RESULT_FILE}" ]; then
-                read -r VAL_LOSS ACC MAD UPDATES <<< "$("${PY}" -c "
+                read -r VAL_LOSS R2 ACC MAD UPDATES <<< "$("${PY}" -c "
 import json
 d = json.load(open('${RESULT_FILE}'))
-print(f\"{d['val_loss']:.4f}\",
+print(f\"{d['val_loss']:.4g}\",
+      f\"{d.get('r2', float('nan')):.4f}\",
       f\"{d.get('accuracy', float('nan')):.3f}\",
       f\"{d.get('mad', float('nan')):.2f}\",
       d['num_updates'])
 ")"
             else
-                VAL_LOSS="N/A"; ACC="N/A"; MAD="N/A"; UPDATES="N/A"
+                VAL_LOSS="N/A"; R2="N/A"; ACC="N/A"; MAD="N/A"; UPDATES="N/A"
             fi
 
-            printf "%-15s  %5s  %8s  %8s  %8s  %10s\n" \
-                "${COND_NAME}" "${LAYER_IDX}" "${VAL_LOSS}" "${ACC}" "${MAD}" "${UPDATES}"
+            printf "%-15s  %5s  %9s  %8s  %8s  %8s  %10s\n" \
+                "${COND_NAME}" "${LAYER_IDX}" "${VAL_LOSS}" "${R2}" "${ACC}" "${MAD}" "${UPDATES}"
         done
     done
 done
