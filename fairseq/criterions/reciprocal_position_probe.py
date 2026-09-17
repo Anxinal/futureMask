@@ -10,16 +10,33 @@ With Q/K pinned to zero, causal attention at position t is the prefix mean
 the network computes. This criterion regresses exactly that quantity, where
 ``dpp_cross_entropy_fix`` classifies ``t`` and so asks the probe to invert it.
 
-The target is scaled: ``c / (t+1)``. Unscaled, late targets are ~2e-3 and their squared
-errors ~1e-6, and since Adam moves each weight by roughly ``lr`` per step whatever the
-gradient's size, a fixed update budget leaves the probe fitting targets far from its
-natural O(1) output range. By default ``c = T / H_T`` (``H_T`` the T-th harmonic number),
-which makes the mean target over positions exactly 1 -- about 75 down to 0.15 at T=512.
-The scale is fixed from ``tokens_per_sample``, never from a batch's length, so it cannot
-drift between batches.
+The target is an affine transform of it: ``c / (t+1) + b``.
 
-A constant scale leaves ``r2``, ``mad`` and ``accuracy`` mathematically unchanged; only
-``loss`` (the MSE, in scaled units) depends on it.
+* Scale ``c`` (``--reciprocal-scale``). Unscaled, late targets are ~2e-3 and their
+  squared errors ~1e-6, far from the probe's natural O(1) output range. By default
+  ``c = T / H_T`` (``H_T`` the T-th harmonic number), which makes the mean target
+  exactly 1 -- about 75 down to 0.15 at T=512. The scale is fixed from
+  ``tokens_per_sample``, never from a batch's length, so it cannot drift.
+* Bias ``b`` (``--reciprocal-bias``), default 0. The probe's output layer has its own
+  trainable bias, so ``b`` is absorbed exactly at the optimum. But Adam moves that
+  parameter by at most ~lr per step: under the probe script's schedule (lr 1e-3,
+  inverse_sqrt, 500 warmup, 6000 updates) it can travel only ~2.7 in the entire run.
+  Keep ``|b|`` well inside that, or the probe must borrow a constant direction from
+  the hidden state to reach it, and the result starts to depend on something other
+  than position.
+
+Mathematically, neither ``c`` nor ``b`` changes ``r2``, ``mad`` or ``accuracy``: R^2 is
+invariant to an affine transform of the target, and the inversion below undoes both
+before comparing positions.
+
+**Numerically, under fp16 they do.** fp16 stores a number with a step of ~1/1024 of
+its magnitude, while neighbouring late positions differ by only ~c/T^2 in the target.
+Near zero those gaps are resolvable; a bias shifts every target away from zero, where
+the steps are coarser than the gaps. Measured with *perfect* predictions stored in fp16
+at T=512: auto scale scores 100% accuracy at b=0, 94.5% at b=0.5, 79.1% at b=1 and
+46.7% at b=5; c=1 with b=5 collapses to 6.2%. fp32 scores 100% in every case. So train
+this probe without ``--fp16`` -- ``exp_probe_causal.sh`` does -- and this criterion
+computes in float64 for the same reason.
 
 Two things to know when reading the metrics:
 
@@ -27,10 +44,11 @@ Two things to know when reading the metrics:
   sliver by t = 50 and every later position sits inside it, so a probe that resolves
   only the first 10 positions and guesses a constant after still scores R^2 ~ 0.96
   while being off by ~157 positions on average.
-* So the prediction is also inverted back to a position, ``t_hat = round(c/pred) - 1``,
-  and scored with the same ``mad`` and ``accuracy`` the classification probe logs. Most
-  positions are late, so these expose exactly the resolution R^2 hides -- and they are
-  directly comparable with the classification probe's numbers.
+* So the prediction is also inverted back to a position,
+  ``t_hat = round(c / (pred - b)) - 1``, and scored with the same ``mad`` and
+  ``accuracy`` the classification probe logs. Most positions are late, so these
+  expose exactly the resolution R^2 hides -- and they are directly comparable with
+  the classification probe's numbers.
 
 Use with ``--arch fixed_attn_probe --probe-target reciprocal``, which gives the probe a
 single output unit.
@@ -55,13 +73,14 @@ def default_reciprocal_scale(max_positions):
     return max_positions / harmonic
 
 
-def reciprocal_probe_stats(pred, valid, scale, max_positions):
+def reciprocal_probe_stats(pred, valid, scale, bias, max_positions):
     """Loss and summable statistics for a batch.
 
     Args:
-        pred:          ``[B, T]`` float predictions of ``scale / (t+1)``.
+        pred:          ``[B, T]`` float predictions of ``scale / (t+1) + bias``.
         valid:         ``[B, T]`` bool, False at padded positions.
-        scale:         the target scale ``c``.
+        scale:         the target scale ``c`` (> 0).
+        bias:          the target offset ``b``.
         max_positions: the configured sequence length; fixes the clamp range.
 
     Returns:
@@ -71,7 +90,7 @@ def reciprocal_probe_stats(pred, valid, scale, max_positions):
     """
     B, T = pred.shape
     t_idx = torch.arange(T, device=pred.device).unsqueeze(0).expand(B, T)
-    target = scale / (t_idx.to(pred.dtype) + 1.0)
+    target = scale / (t_idx.to(pred.dtype) + 1.0) + bias
 
     p = pred[valid]
     r = target[valid]
@@ -80,10 +99,11 @@ def reciprocal_probe_stats(pred, valid, scale, max_positions):
     loss = (p - r).pow(2).sum()
 
     with torch.no_grad():
-        # c/(t+1) lives in [c/T, c]. Clamp before inverting, so a prediction at or
-        # below zero maps to the last position rather than to inf or a negative index.
-        clamped = p.clamp(min=scale / max_positions, max=scale)
-        t_hat = torch.round(scale / clamped) - 1
+        # Undo the bias, then invert. c/(t+1) lives in [c/T, c]; clamping first maps a
+        # prediction at or below the bias to the last position rather than to inf or a
+        # negative index.
+        unbiased = (p - bias).clamp(min=scale / max_positions, max=scale)
+        t_hat = torch.round(scale / unbiased) - 1
         stats = {
             "rp_total": p.numel(),
             "rp_sq_err": loss.detach(),
@@ -100,9 +120,18 @@ class ReciprocalPositionProbeConfig(FairseqDataclass):
     reciprocal_scale: float = field(
         default=0.0,
         metadata={
-            "help": "multiply the 1/(t+1) target by this constant. 0 (default) uses "
-            "T/H_T, which makes the mean target exactly 1. Changes only the loss's "
+            "help": "scale c in the target c/(t+1) + b. 0 (default) uses T/H_T, which "
+            "makes the mean of c/(t+1) exactly 1. Must be >= 0. Changes only the loss's "
             "units and the optimisation, never r2, mad or accuracy."
+        },
+    )
+    reciprocal_bias: float = field(
+        default=0.0,
+        metadata={
+            "help": "constant offset b in the target c/(t+1) + b. Absorbed exactly by "
+            "the probe's trainable output bias, so it never changes r2, mad, accuracy "
+            "or the best achievable loss -- but that bias can only travel ~2.7 over a "
+            "6000-update inverse_sqrt run at lr 1e-3, so keep |b| small."
         },
     )
     tokens_per_sample: int = II("task.tokens_per_sample")
@@ -110,20 +139,30 @@ class ReciprocalPositionProbeConfig(FairseqDataclass):
 
 @register_criterion("reciprocal_position_probe", dataclass=ReciprocalPositionProbeConfig)
 class ReciprocalPositionProbeCriterion(FairseqCriterion):
-    def __init__(self, task, reciprocal_scale=0.0, tokens_per_sample=512):
+    def __init__(
+        self, task, reciprocal_scale=0.0, reciprocal_bias=0.0, tokens_per_sample=512
+    ):
         super().__init__(task)
         self.max_positions = int(tokens_per_sample)
+
+        # A negative scale reverses the ordering the inversion relies on and has no use.
+        assert reciprocal_scale >= 0, (
+            f"--reciprocal-scale must be >= 0 (0 = auto), got {reciprocal_scale}"
+        )
         self.scale = (
             float(reciprocal_scale)
-            if reciprocal_scale and reciprocal_scale > 0
+            if reciprocal_scale > 0
             else default_reciprocal_scale(self.max_positions)
         )
+        self.bias = float(reciprocal_bias)
+
         logger.info(
-            "reciprocal probe: target = %.4f / (t+1) over T=%d (range %.4f .. %.4f)",
+            "reciprocal probe: target = %.4f / (t+1) + %.4f over T=%d (range %.4f .. %.4f)",
             self.scale,
+            self.bias,
             self.max_positions,
-            self.scale / self.max_positions,
-            self.scale,
+            self.scale / self.max_positions + self.bias,
+            self.scale + self.bias,
         )
 
     def forward(self, model, sample, reduce=True):
@@ -140,12 +179,16 @@ class ReciprocalPositionProbeCriterion(FairseqCriterion):
             f"reciprocal_position_probe expects a 1-unit probe head, got "
             f"{pred.size(-1)} outputs -- pass --probe-target reciprocal"
         )
-        pred = pred.squeeze(-1).float()
+        # float64 for the criterion's own arithmetic: recovering a late target of ~c/T
+        # from a prediction offset by b cancels most of float32's ~7 digits (at c=1,
+        # b=-5 it visibly shifts mad and r2). The loss goes back as float32.
+        pred = pred.squeeze(-1).double()
         valid = sample["target"].ne(self.padding_idx)
 
         loss, stats = reciprocal_probe_stats(
-            pred, valid, self.scale, self.max_positions
+            pred, valid, self.scale, self.bias, self.max_positions
         )
+        loss = loss.float()
         sample_size = int(stats["rp_total"])
 
         logging_output = {
