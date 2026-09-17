@@ -103,12 +103,7 @@ RANDOM_TOKEN_PROB=0.1
 #               Useful for running this locally against an existing install.
 # SMOKE       : 1 = tiny model, ~100 updates -- wiring validation, not a result.
 # RUN_VERIFY  : 1 = run verify_attn_recovery.py after stage A and abort on failure.
-# NUM_WORKERS : DataLoader worker processes. 0 loads in the main process, which
-#               removes the "DataLoader worker exited unexpectedly" failure mode
-#               entirely -- that message means the workers were killed (cgroup memory
-#               limit or a small /dev/shm), not that the data is bad. The dataset is
-#               memory-mapped and the masking is cheap, while the GPU step dominates,
-#               so 0 costs little here. Raise it once the job is known to fit.
+
 FRESH_START=${FRESH_START:-1}
 SKIP_SETUP=${SKIP_SETUP:-0}
 SMOKE=${SMOKE:-0}
@@ -501,54 +496,15 @@ for cond_str in "${CONDITIONS[@]}"; do
     printf '      %s\n' "python -m fairseq_cli.train ${STUDENT_ARGS[*]}"
     "${PY}" -m fairseq_cli.train "${STUDENT_ARGS[@]}" 2>&1 | tee "${TRAIN_LOG}"
 
-    # Recover the final validation metrics from the JSON log. --log-format json emits
-    # one object per line, validation records prefixed "valid_" (progress_bar.py).
-    RESULT_FILE="${RESULT_FILE}" TRAIN_LOG="${TRAIN_LOG}" COND="${COND_NAME}" \
-    SPEC="${SPEC}" SEED="${SEED}" UPDATES="${STUDENT_MAX_UPDATES}" \
-    "${PY}" - <<'PYEOF'
-import json, os
-
-log = os.environ["TRAIN_LOG"]
-keys = ("valid_loss", "valid_mae", "valid_rel_l2", "valid_cos", "valid_mae_baseline")
-found = {}
-with open(log) as f:
-    for line in f:
-        line = line.strip()
-        if not line.startswith("{") or "valid" not in line:
-            continue
-        try:
-            rec = json.loads(line)
-        except ValueError:
-            continue
-        for k in keys:
-            if k in rec:
-                found[k] = float(rec[k])
-        # print() prefixes every key with the subset tag, so a validation record
-        # carries "valid_num_updates"; only train_inner lines have it bare.
-        for k in ("valid_num_updates", "num_updates"):
-            if k in rec:
-                try:
-                    found["num_updates"] = int(float(rec[k]))
-                except ValueError:
-                    pass
-                break
-
-result = {
-    "condition": os.environ["COND"],
-    "head_mask_spec": os.environ["SPEC"],
-    "seed": int(os.environ["SEED"]),
-    "mae": found.get("valid_mae", float("nan")),
-    "rel_l2": found.get("valid_rel_l2", float("nan")),
-    "cos": found.get("valid_cos", float("nan")),
-    "mae_baseline": found.get("valid_mae_baseline", float("nan")),
-    "num_updates": found.get("num_updates", -1),
-}
-with open(os.environ["RESULT_FILE"], "w") as f:
-    json.dump(result, f, indent=2)
-print("      Saved", os.environ["RESULT_FILE"])
-if not found:
-    raise SystemExit("FATAL: no validation records found in " + log)
-PYEOF
+    # Recover the final validation metrics from the log. The parser lives in
+    # extract_results.py so the identical code can rebuild results from logs after the
+    # fact, without retraining -- see its docstring for the log format.
+    "${PY}" nopos_experiments/attn_recovery/extract_results.py \
+        --log       "${TRAIN_LOG}" \
+        --out       "${RESULT_FILE}" \
+        --condition "${COND_NAME}" \
+        --spec      "${SPEC}" \
+        --seed      "${SEED}"
 
     echo "      [${TAG}] Done."
 done
