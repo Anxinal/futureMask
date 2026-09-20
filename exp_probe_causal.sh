@@ -87,36 +87,48 @@ PROBE_VALIDATE_EVERY=500
 #              whether the probe can read that signal directly, rather than invert it.
 PROBE_TARGET=${PROBE_TARGET:-reciprocal}
 
-# ---- Reciprocal target  c/(t+1) + b  --  ADJUST SCALE AND BIAS HERE -----------
+# ---- Reciprocal target  c/(t+a)  --  ADJUST SCALE AND OFFSET HERE ------------
 # Edit the defaults below, or override per job without touching this file:
 #
-#     RECIPROCAL_SCALE=512 RECIPROCAL_BIAS=0.5 sbatch exp_probe_causal.sh
+#     RECIPROCAL_SCALE=512 RECIPROCAL_OFFSET=10 sbatch exp_probe_causal.sh
 #
-# RECIPROCAL_SCALE (c) : 0 = auto, T/H_T (H_T the T-th harmonic number), which makes
-#     the mean of c/(t+1) exactly 1 -- about 75 down to 0.15 at T=512. Unscaled,
-#     late targets are ~2e-3. Must be >= 0.
-# RECIPROCAL_BIAS  (b) : constant offset, default 0. The probe head's own trainable
-#     bias absorbs b exactly at the optimum -- but Adam moves that parameter by at
-#     most ~lr per step, so over this schedule it can travel only a few units in the
-#     whole run (the exact budget is computed and printed below). Keep |b| small, or
-#     the probe has to borrow a constant direction from the hidden state to reach it
-#     and stops measuring position alone.
+# RECIPROCAL_SCALE (c) : 0 = auto, T / sum_t 1/(t+a), which makes the mean target
+#     exactly 1 (about 75 down to 0.15 at T=512, a=1). Unscaled, late targets are
+#     ~2e-3, far from the probe's natural output range. Must be >= 0. Multiplicative,
+#     so it cannot change r2, mad or accuracy -- only the loss's units.
+# RECIPROCAL_OFFSET (a): denominator offset, default 1. Must be > 0. This one does
+#     reshape the target. Measured at T=512:
 #
-# Mathematically neither c nor b changes r2, mad or accuracy: R^2 is invariant to an
-# affine map of the target, and the position inversion undoes both. That holds in
-# practice only because the reciprocal probe trains in fp32 -- under fp16 a bias of
-# 1 already costs even a perfect probe 21 points of accuracy (see the TRAIN_ARGS
-# note below). Non-default values are written into the run tag (e.g.
-# "_recip_c512_b0.5"), so adjusting them starts fresh runs instead of being mistaken
+#         a      range     R^2 of a probe resolving      ceiling for a LINEAR probe
+#                          only t<10, guessing after
+#         1       512x             0.959                          1.000
+#         10       52x             0.613                          0.601
+#         50       11x             0.277                          0.306
+#
+#     Larger a compresses the range and stops r2 flattering a probe that resolves
+#     nothing late. The cost lands on the LINEAR arms only: the network computes
+#     1/(t+1), and c/(t+a) is a Moebius transform of it that no linear map can
+#     produce. The *_mlp arms (--non-linear-probe) can represent it and are uncapped.
+#
+#     a=1 is the default because it keeps the linear-vs-MLP contrast clean -- that
+#     contrast is the experiment's point, and at a != 1 a linear arm's shortfall
+#     mixes "not linearly decodable" with "target is not linear in the signal". At
+#     a != 1 the script prints the linear ceiling; read the linear arms against it.
+#
+# There is deliberately no "+ b" outside the fraction: the probe head's own trainable
+# bias absorbs such a term exactly (same weights, intercept shifted by b), so it
+# cannot move any metric. Non-default values go into the run tag (e.g.
+# "_recip_c512_a10"), so adjusting them starts fresh runs instead of being mistaken
 # for finished ones and skipped.
 RECIPROCAL_SCALE=${RECIPROCAL_SCALE:-0}
-RECIPROCAL_BIAS=${RECIPROCAL_BIAS:-0}
+RECIPROCAL_OFFSET=${RECIPROCAL_OFFSET:-1}
 
-# Read r2 TOGETHER WITH mad. Both the loss and r2 are dominated by early positions:
-# a probe that resolves only t < 10 and guesses a constant afterwards scores
-# r2 ~ 0.96 while being off by ~157 positions on average. mad and accuracy invert
-# the prediction back to a position, and are comparable with the classification
-# probe's numbers. Position-probe results keep their original, untagged names.
+# Read r2 TOGETHER WITH mad. At a=1 both the loss and r2 are dominated by early
+# positions: a probe that resolves only t < 10 and guesses a constant afterwards
+# scores r2 ~ 0.96 while being off by ~157 positions on average. mad and accuracy
+# invert the prediction back to a position, and are comparable with the
+# classification probe's numbers. Position-probe results keep their original,
+# untagged names.
 
 case "${PROBE_TARGET}" in
     position)
@@ -127,7 +139,7 @@ case "${PROBE_TARGET}" in
         PROBE_CRITERION=reciprocal_position_probe
         TARGET_TAG="_recip"
         if [ "${RECIPROCAL_SCALE}" != "0" ]; then TARGET_TAG="${TARGET_TAG}_c${RECIPROCAL_SCALE}"; fi
-        if [ "${RECIPROCAL_BIAS}" != "0" ]; then TARGET_TAG="${TARGET_TAG}_b${RECIPROCAL_BIAS}"; fi
+        if [ "${RECIPROCAL_OFFSET}" != "1" ]; then TARGET_TAG="${TARGET_TAG}_a${RECIPROCAL_OFFSET}"; fi
         ;;
     *)
         echo "FATAL: PROBE_TARGET must be 'position' or 'reciprocal', got '${PROBE_TARGET}'" >&2
@@ -172,37 +184,43 @@ PROBE_LAYERS=(0 1 2)
 
 # ---- Resolved reciprocal target ---------------------------------------------
 # Echo what the knobs above actually mean before anything trains. RECIPROCAL_SCALE=0
-# is a sentinel for "auto", NOT a multiplier of zero: it resolves to c = T/H_T, the
-# scale at which the mean of c/(t+1) over the sequence is exactly 1.
+# is a sentinel for "auto", NOT a multiplier of zero: it resolves to the c that makes
+# the mean of c/(t+a) equal 1.
 if [ "${PROBE_TARGET}" = "reciprocal" ]; then
     if awk -v c="${RECIPROCAL_SCALE}" 'BEGIN{exit !(c < 0)}'; then
         echo "FATAL: RECIPROCAL_SCALE must be >= 0 (0 = auto), got '${RECIPROCAL_SCALE}'" >&2
         exit 1
     fi
-
-    for L in "${EVAL_LENGTHS[@]}"; do
-        EFF_C=$(awk -v c="${RECIPROCAL_SCALE}" -v T="${L}" \
-            'BEGIN { if (c > 0) { printf "%.4f", c }
-                     else { h = 0; for (i = 1; i <= T; i++) h += 1 / i; printf "%.4f", T / h } }')
-        RANGE=$(awk -v c="${EFF_C}" -v T="${L}" -v b="${RECIPROCAL_BIAS}" \
-            'BEGIN { printf "%.4f .. %.4f", c / T + b, c + b }')
-        echo "Reciprocal target (T=${L}): ${EFF_C}/(t+1) + ${RECIPROCAL_BIAS}   [${RANGE}]"
-    done
-    if [ "${RECIPROCAL_SCALE}" = "0" ]; then
-        echo "  scale auto: c = T/H_T. Set RECIPROCAL_SCALE to a positive number to override."
+    if awk -v a="${RECIPROCAL_OFFSET}" 'BEGIN{exit !(a <= 0)}'; then
+        echo "FATAL: RECIPROCAL_OFFSET must be > 0, got '${RECIPROCAL_OFFSET}'" >&2
+        exit 1
     fi
 
-    # How far the probe's output bias can move over this run: the sum of the
-    # inverse_sqrt learning rate across all updates (Adam steps each parameter by at
-    # most ~lr). Mirrors fairseq/optim/lr_scheduler/inverse_square_root_schedule.py.
-    BIAS_BUDGET=$(awk -v lr="${PROBE_LR}" -v W="${PROBE_WARMUP}" -v N="${PROBE_MAX_UPDATES}" \
-        'BEGIN { d = lr * sqrt(W); s = 0
-                 for (u = 0; u < N; u++) s += (u < W) ? u * lr / W : d / sqrt(u)
-                 printf "%.2f", s }')
-    echo "  the probe's output bias can travel ~${BIAS_BUDGET} over this run."
-    if awk -v b="${RECIPROCAL_BIAS}" -v m="${BIAS_BUDGET}" 'BEGIN{exit !((b < 0 ? -b : b) > m / 2)}'; then
-        echo "WARNING: |RECIPROCAL_BIAS| = ${RECIPROCAL_BIAS} is over half that budget." >&2
-        echo "         Expect a slow fit that leans on hidden-state constants, not position." >&2
+    for L in "${EVAL_LENGTHS[@]}"; do
+        EFF_C=$(awk -v c="${RECIPROCAL_SCALE}" -v a="${RECIPROCAL_OFFSET}" -v T="${L}" \
+            'BEGIN { if (c > 0) { printf "%.4f", c }
+                     else { s = 0; for (t = 0; t < T; t++) s += 1 / (t + a); printf "%.4f", T / s } }')
+        RANGE=$(awk -v c="${EFF_C}" -v a="${RECIPROCAL_OFFSET}" -v T="${L}" \
+            'BEGIN { printf "%.4f .. %.4f", c / (T - 1 + a), c / a }')
+        echo "Reciprocal target (T=${L}): ${EFF_C}/(t + ${RECIPROCAL_OFFSET})   [${RANGE}]"
+
+        # What a perfect LINEAR probe can reach: the best least-squares fit of
+        # c/(t+a) from the 1/(t+1) the network actually computes. Exactly 1 at a=1.
+        if [ "${RECIPROCAL_OFFSET}" != "1" ]; then
+            CEIL=$(awk -v c="${EFF_C}" -v a="${RECIPROCAL_OFFSET}" -v T="${L}" \
+                'BEGIN { for (t = 0; t < T; t++) { u = 1/(t+1); y = c/(t+a)
+                             su += u; sy += y; suu += u*u; suy += u*y; syy += y*y }
+                         d = T*suu - su*su
+                         w = (T*suy - su*sy) / d; b = (sy - w*su) / T
+                         sse = syy - 2*w*suy - 2*b*sy + w*w*suu + 2*w*b*su + T*b*b
+                         sst = syy - sy*sy/T
+                         printf "%.3f", 1 - sse/sst }')
+            echo "  a != 1: a perfect LINEAR probe is capped at R2 = ${CEIL} here;" \
+                 "the *_mlp arms are not capped."
+        fi
+    done
+    if [ "${RECIPROCAL_SCALE}" = "0" ]; then
+        echo "  scale auto: c = T / sum_t 1/(t+a). Set RECIPROCAL_SCALE > 0 to override."
     fi
 fi
 
@@ -504,19 +522,20 @@ for cond_str in "${CONDITIONS[@]}"; do
                 TRAIN_ARGS+=(${COND_EXTRA})
             fi
             # These belong to the reciprocal criterion's config, so passing them
-            # alongside dpp_cross_entropy_fix would be rejected. The "=" form keeps a
-            # negative bias from being parsed as an option name.
+            # alongside dpp_cross_entropy_fix would be rejected. The "=" form avoids
+            # any value being parsed as an option name.
             #
             # The reciprocal probe trains in fp32. fp16 stores the probe's output with
-            # a step of ~1/1024 of its magnitude, coarser than the gap between
-            # neighbouring late positions once a bias moves the targets off zero: even a
-            # perfect probe scores 79% accuracy at b=1 and 47% at b=5 in fp16, 100% in
-            # fp32 (see reciprocal_position_probe.py). The classification probe's logits
+            # a step of ~1/1024 of its magnitude, and neighbouring late positions
+            # differ by only ~c/T^2: perfect predictions still invert exactly up to
+            # about a=200, but the margin shrinks as larger a bunches the targets
+            # together (98% accuracy at a=1000). fp32 keeps the offset knob safe across
+            # its whole range on a model this small. The classification probe's logits
             # are not sensitive to this and keep fp16.
             if [ "${PROBE_TARGET}" = "reciprocal" ]; then
                 TRAIN_ARGS+=(
                     "--reciprocal-scale=${RECIPROCAL_SCALE}"
-                    "--reciprocal-bias=${RECIPROCAL_BIAS}"
+                    "--reciprocal-offset=${RECIPROCAL_OFFSET}"
                 )
             else
                 TRAIN_ARGS+=(--fp16)
@@ -581,8 +600,9 @@ result = {
 # Record the target actually used, with the auto scale resolved to its number.
 if '${PROBE_TARGET}' == 'reciprocal':
     T = ${EVAL_LEN}
-    result['reciprocal_scale'] = float('${RECIPROCAL_SCALE}') or T / sum(1.0 / i for i in range(1, T + 1))
-    result['reciprocal_bias'] = float('${RECIPROCAL_BIAS}')
+    a = float('${RECIPROCAL_OFFSET}')
+    result['reciprocal_scale'] = float('${RECIPROCAL_SCALE}') or T / sum(1.0 / (t + a) for t in range(T))
+    result['reciprocal_offset'] = float('${RECIPROCAL_OFFSET}')
 
 with open('${RESULT_FILE}', 'w') as f:
     json.dump(result, f, indent=2)
@@ -605,7 +625,7 @@ echo "======================================================"
 echo ""
 echo "  Probe target: ${PROBE_TARGET}"
 if [ "${PROBE_TARGET}" = "reciprocal" ]; then
-    echo "  Target c/(t+1) + b with c=${RECIPROCAL_SCALE} (0 = auto), b=${RECIPROCAL_BIAS}."
+    echo "  Target c/(t+a) with c=${RECIPROCAL_SCALE} (0 = auto), a=${RECIPROCAL_OFFSET}."
     echo "  VAL_LOSS is the MSE in those units. Chance is R2 ~ 0."
     echo "  Read R2 together with MAD: R2 is dominated by early positions and stays"
     echo "  high for a probe with almost no late-position resolution."
