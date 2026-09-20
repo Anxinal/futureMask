@@ -135,26 +135,6 @@ case "${PROBE_TARGET}" in
         ;;
 esac
 
-if [ "${PROBE_TARGET}" = "reciprocal" ]; then
-    if awk -v c="${RECIPROCAL_SCALE}" 'BEGIN{exit !(c < 0)}'; then
-        echo "FATAL: RECIPROCAL_SCALE must be >= 0 (0 = auto), got '${RECIPROCAL_SCALE}'" >&2
-        exit 1
-    fi
-    # How far the probe's output bias can move over this run: the sum of the
-    # inverse_sqrt learning rate across all updates (Adam steps each parameter by at
-    # most ~lr). Mirrors fairseq/optim/lr_scheduler/inverse_square_root_schedule.py.
-    BIAS_BUDGET=$(awk -v lr="${PROBE_LR}" -v W="${PROBE_WARMUP}" -v N="${PROBE_MAX_UPDATES}" \
-        'BEGIN { d = lr * sqrt(W); s = 0
-                 for (u = 0; u < N; u++) s += (u < W) ? u * lr / W : d / sqrt(u)
-                 printf "%.2f", s }')
-    echo "Reciprocal target: c=${RECIPROCAL_SCALE} (0 = auto), b=${RECIPROCAL_BIAS};" \
-         "the probe's output bias can travel ~${BIAS_BUDGET} over this run."
-    if awk -v b="${RECIPROCAL_BIAS}" -v m="${BIAS_BUDGET}" 'BEGIN{exit !((b < 0 ? -b : b) > m / 2)}'; then
-        echo "WARNING: |RECIPROCAL_BIAS| = ${RECIPROCAL_BIAS} is over half that budget." >&2
-        echo "         Expect a slow fit that leans on hidden-state constants, not position." >&2
-    fi
-fi
-
 # ---- Conditions to run ------------------------------------------------------
 # Each condition: NAME|EXTRA_FLAGS
 #   NAME        : identifier for result dirs / tags
@@ -189,6 +169,42 @@ EVAL_LENGTHS=(512)
 # ---- Probe layers (0 = embedding output, 1..N = decoder layer outputs) -----
 # For a 2-layer decoder: 0 = embedding, 1 = layer 0, 2 = layer 1
 PROBE_LAYERS=(0 1 2)
+
+# ---- Resolved reciprocal target ---------------------------------------------
+# Echo what the knobs above actually mean before anything trains. RECIPROCAL_SCALE=0
+# is a sentinel for "auto", NOT a multiplier of zero: it resolves to c = T/H_T, the
+# scale at which the mean of c/(t+1) over the sequence is exactly 1.
+if [ "${PROBE_TARGET}" = "reciprocal" ]; then
+    if awk -v c="${RECIPROCAL_SCALE}" 'BEGIN{exit !(c < 0)}'; then
+        echo "FATAL: RECIPROCAL_SCALE must be >= 0 (0 = auto), got '${RECIPROCAL_SCALE}'" >&2
+        exit 1
+    fi
+
+    for L in "${EVAL_LENGTHS[@]}"; do
+        EFF_C=$(awk -v c="${RECIPROCAL_SCALE}" -v T="${L}" \
+            'BEGIN { if (c > 0) { printf "%.4f", c }
+                     else { h = 0; for (i = 1; i <= T; i++) h += 1 / i; printf "%.4f", T / h } }')
+        RANGE=$(awk -v c="${EFF_C}" -v T="${L}" -v b="${RECIPROCAL_BIAS}" \
+            'BEGIN { printf "%.4f .. %.4f", c / T + b, c + b }')
+        echo "Reciprocal target (T=${L}): ${EFF_C}/(t+1) + ${RECIPROCAL_BIAS}   [${RANGE}]"
+    done
+    if [ "${RECIPROCAL_SCALE}" = "0" ]; then
+        echo "  scale auto: c = T/H_T. Set RECIPROCAL_SCALE to a positive number to override."
+    fi
+
+    # How far the probe's output bias can move over this run: the sum of the
+    # inverse_sqrt learning rate across all updates (Adam steps each parameter by at
+    # most ~lr). Mirrors fairseq/optim/lr_scheduler/inverse_square_root_schedule.py.
+    BIAS_BUDGET=$(awk -v lr="${PROBE_LR}" -v W="${PROBE_WARMUP}" -v N="${PROBE_MAX_UPDATES}" \
+        'BEGIN { d = lr * sqrt(W); s = 0
+                 for (u = 0; u < N; u++) s += (u < W) ? u * lr / W : d / sqrt(u)
+                 printf "%.2f", s }')
+    echo "  the probe's output bias can travel ~${BIAS_BUDGET} over this run."
+    if awk -v b="${RECIPROCAL_BIAS}" -v m="${BIAS_BUDGET}" 'BEGIN{exit !((b < 0 ? -b : b) > m / 2)}'; then
+        echo "WARNING: |RECIPROCAL_BIAS| = ${RECIPROCAL_BIAS} is over half that budget." >&2
+        echo "         Expect a slow fit that leans on hidden-state constants, not position." >&2
+    fi
+fi
 
 # ---- Paths ------------------------------------------------------------------
 REPO_DIR="${SLURM_SUBMIT_DIR}"
