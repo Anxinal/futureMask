@@ -4,7 +4,7 @@
 #SBATCH --error=fixattn_%j.err
 #SBATCH --gpus=h100-96:1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=32G
+#SBATCH --mem=64G
 #SBATCH --time=8:00:00
 #SBATCH --partition=gpu-long
 
@@ -73,10 +73,10 @@ BASE_LR=5e-4
 FRESH_START=1
 
 # ---- Probe training --------------------------------------------------------
-PROBE_MAX_UPDATES=6000
+PROBE_MAX_UPDATES=12000
 PROBE_LR=1e-3
 PROBE_WARMUP=500
-PROBE_MAX_TOKENS=4096
+PROBE_MAX_TOKENS=8192
 PROBE_VALIDATE_EVERY=500
 
 # ---- Probe target -----------------------------------------------------------
@@ -438,7 +438,7 @@ else
         --no-epoch-checkpoints \
         --log-interval                  100 \
         --log-format                    json \
-        --num-workers                   4 \
+        --num-workers                   0 \
         --seed                          "${SEED}"
 
     echo "      Base LM training done -- ${BASE_CKPT}"
@@ -512,7 +512,7 @@ for cond_str in "${CONDITIONS[@]}"; do
                 --no-epoch-checkpoints
                 --log-interval                  50
                 --log-format                    json
-                --num-workers                   4
+                --num-workers                   0
                 --seed                          "${SEED}"
             )
 
@@ -550,22 +550,18 @@ for cond_str in "${CONDITIONS[@]}"; do
             "${PY}" -c "
 import json, os, sys
 
-ckpt_path = os.path.join('${SAVE_DIR}', 'checkpoint_last.pt')
-if not os.path.exists(ckpt_path):
-    print(f'WARNING: {ckpt_path} not found', file=sys.stderr)
-    sys.exit(0)
-
-import torch
-state = torch.load(ckpt_path, map_location='cpu', weights_only=False)
-extra = state.get('extra_state', {})
-val_loss = extra.get('best', float('nan'))
-
-# Keep the last validation record's accuracy / mad (and r2 for the reciprocal probe).
+# Every metric in a row comes from the SAME (last) validation pass. val_loss used to
+# be read from the checkpoint's extra_state['best'] -- the best loss over training --
+# while accuracy/mad/r2 came from the last pass, so a row mixed two moments and
+# disagreed whenever the probe wobbled or overfitted. best_val_loss is still reported
+# alongside, clearly labelled.
+#
 # fairseq writes these records through the logging module, so each line reads
 #   2026-09-17 10:00:00 | INFO | valid | {\"epoch\": 1, \"valid_mad\": ...}
 # -- the JSON is a suffix, not the whole line. Matching on line.startswith('{')
 # found nothing and silently recorded nan; parse from the first brace instead.
-accuracy = mad = r2 = float('nan')
+val_loss = accuracy = mad = r2 = float('nan')
+num_updates = -1
 try:
     with open('${TRAIN_LOG}') as f:
         for line in f:
@@ -576,14 +572,30 @@ try:
                 rec = json.loads(line[brace:])
             except ValueError:
                 continue
+            if 'valid_loss' in rec:
+                val_loss = float(rec['valid_loss'])
             if 'valid_accuracy' in rec:
                 accuracy = float(rec['valid_accuracy'])
             if 'valid_mad' in rec:
                 mad = float(rec['valid_mad'])
             if 'valid_r2' in rec:
                 r2 = float(rec['valid_r2'])
+            if 'valid_num_updates' in rec:
+                num_updates = int(float(rec['valid_num_updates']))
 except OSError:
     pass
+
+if val_loss != val_loss:
+    print('FATAL: no validation records found in ${TRAIN_LOG}', file=sys.stderr)
+    sys.exit(1)
+
+# The checkpoint is optional now -- only the best-loss figure comes from it.
+best_val_loss = float('nan')
+ckpt_path = os.path.join('${SAVE_DIR}', 'checkpoint_last.pt')
+if os.path.exists(ckpt_path):
+    import torch
+    state = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+    best_val_loss = state.get('extra_state', {}).get('best', float('nan'))
 
 result = {
     'condition': '${COND_NAME}',
@@ -592,10 +604,11 @@ result = {
     'eval_length': ${EVAL_LEN},
     'seed': ${SEED},
     'val_loss': val_loss,
+    'best_val_loss': best_val_loss,
     'r2': r2,
     'accuracy': accuracy,
     'mad': mad,
-    'num_updates': state.get('optimizer_history', [{}])[-1].get('num_updates', -1),
+    'num_updates': num_updates,
 }
 # Record the target actually used, with the auto scale resolved to its number.
 if '${PROBE_TARGET}' == 'reciprocal':
