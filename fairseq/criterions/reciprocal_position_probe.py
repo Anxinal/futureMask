@@ -10,65 +10,68 @@ With Q/K pinned to zero, causal attention at position t is the prefix mean
 the network computes. This criterion regresses that quantity, where
 ``dpp_cross_entropy_fix`` classifies ``t`` and so asks the probe to invert it.
 
-The target is
+Target
+------
 
     y_t = c / (t + a)        t = 0 .. T-1
 
-with two knobs, both of which genuinely change the target -- unlike an additive
-``+ b`` outside the fraction, which the probe's own trainable output bias absorbs
-exactly (same weights, intercept shifted by b) and which therefore cannot move any
-metric.
+``c`` (``--reciprocal-scale``, 0 = auto = ``T / sum_t 1/(t+a)``, which puts the mean
+target at 1) is multiplicative and cannot change r2/mad/accuracy. ``a``
+(``--reciprocal-offset``, default 1) sits inside the denominator and does reshape the
+target: larger ``a`` compresses its range (512x at a=1, 52x at a=10, 11x at a=50) and
+stops R^2 flattering a probe with no late-position resolution, at the price of capping
+the *linear* arms -- c/(t+a) is a Moebius transform of the 1/(t+1) the network
+computes, which no linear map can produce (ceiling R^2 0.60 at a=10, 0.31 at a=50).
+The ``*_mlp`` arms are uncapped. ``exp_probe_causal.sh`` prints that ceiling.
 
-Scale ``c`` (``--reciprocal-scale``)
-    Multiplicative, so it cannot change ``r2``, ``mad`` or ``accuracy`` either -- R^2
-    is scale invariant and the inversion divides it out. It exists for conditioning:
-    unscaled, late targets are ~2e-3, far from the probe's natural O(1) output range.
-    Default (0) resolves to ``c = T / sum_t 1/(t+a)``, making the mean target exactly
-    1. The scale is fixed from ``tokens_per_sample``, never a batch's length.
+Loss weighting
+--------------
 
-Offset ``a`` (``--reciprocal-offset``, default 1)
-    Inside the denominator, so it reshapes the target and is a real knob. It trades
-    metric honesty against what a linear probe can express, measured at T=512:
+Plain MSE on this target is almost blind to late positions, which is what made an
+early run post loss 0.15 / R^2 0.96 while its MAD was still 70 positions out of 512:
 
-      a       range (max/min)    R^2 of a probe resolving      best linear R^2
-                                 only t<10, guessing after     from the 1/(t+1) signal
-      1            512x                    0.959                      1.000
-      2            257x                    --                         0.947
-      10            52x                    0.613                      0.601
-      50            11x                    0.277                      0.306
+* the target spans 103x from t=0 to t=511 (at a=5), so **75% of its variance lives in
+  the first 10 positions** and 92% in the first 50;
+* the inversion amplifies error quadratically, ``|dt/dy| = (t+a)^2/c``, so 0.01 of
+  target error is 0.3 positions at t=50 but 24.7 positions at t=511;
+* being 70 positions wrong at t=300 is a target error of 0.066, which is 0.01% of the
+  total loss budget. The optimizer has no reason to fix it, and does not.
 
-    Larger ``a`` compresses the range and makes R^2 much harder to fool. The cost
-    falls on the *linear* arms only: the network computes 1/(t+1), and c/(t+a) is a
-    Moebius transform of it, which no linear map can produce, so a perfect linear
-    probe is capped at the last column. The MLP arms (``--non-linear-probe``) can
-    represent that transform and are not capped.
+``--reciprocal-loss-weight jacobian`` (the default) fixes that by weighting each
+token's squared error with the squared Jacobian ``((t+a)^2/c)^2``, so the loss becomes
+the squared error *in position space*: every position then contributes on the same
+scale, whatever its target magnitude. The weights are normalised to mean 1 over the
+configured T, which keeps the loss and its gradients in the same numeric range as the
+unweighted version -- a constant factor that changes neither the optimum nor the
+relative weighting between positions. ``none`` restores plain MSE.
 
-    ``a = 1`` is the default because it keeps the linear-vs-MLP contrast clean: the
-    experiment asks how much of the signal is *linearly* decodable, and at a != 1 a
-    linear arm's shortfall mixes that with the target's own nonlinearity. Raising
-    ``a`` is reasonable when the MLP arms are what you care about, or to stop R^2
-    flattering a probe with no late-position resolution -- just read each linear arm
-    against its ceiling rather than against 1.0. ``exp_probe_causal.sh`` prints that
-    ceiling for the configured ``a``.
+Expect the trade this buys: R^2 and the raw MSE are target-space quantities dominated
+by early positions, so **they can get worse while mad, accuracy and pos_rmse improve**.
+That is the intended direction, not a regression.
 
-Reading the metrics at a = 1: ``loss`` and ``r2`` are dominated by early positions,
-so the prediction is also inverted back to a position,
-``t_hat = round(c / pred - a)``, and scored with the same ``mad`` and ``accuracy``
-the classification probe logs. Those expose the late-position resolution R^2 hides
-and are directly comparable with the classification probe's numbers.
+Metrics
+-------
 
-Precision: this probe trains without ``--fp16``. Stored in fp16, perfect predictions
-still invert to 100% accuracy up to about a = 200, but the margin shrinks as the
-targets bunch together (98% at a = 1000), and fp32 keeps the knob safe across its
-whole range on a model this small. The criterion computes in float64 for the same
-reason.
+``loss``      weighted (or plain) MSE in target units.
+``r2``        target-space explained variance, unweighted, so it stays comparable
+              across weightings. Read it together with the position-space numbers.
+``pos_rmse``  RMS of the first-order position error ``((t+a)^2/c) * (pred - y)``.
+              Directly comparable with ``mad``; the gap between them shows how much
+              of the error sits in a few bad positions.
+``mad`` /     exact inversion ``t_hat = round(c/pred - a)`` scored against t, the same
+``accuracy``  metrics the classification probe logs.
+``mad_q1..4`` ``mad`` within each quarter of the sequence -- where the error actually
+              is. A single ``mad`` hides a strong position gradient.
 
-Use with ``--arch fixed_attn_probe --probe-target reciprocal``, which gives the probe a
-single output unit.
+Precision: this probe trains without ``--fp16`` (see ``exp_probe_causal.sh``), and the
+criterion computes in float64.
+
+Use with ``--arch fixed_attn_probe --probe-target reciprocal``.
 """
 
 import logging
 from dataclasses import dataclass, field
+from functools import lru_cache
 
 import torch
 from omegaconf import II
@@ -79,6 +82,8 @@ from fairseq.dataclass import FairseqDataclass
 
 logger = logging.getLogger(__name__)
 
+N_BUCKETS = 4
+
 
 def default_reciprocal_scale(max_positions, offset=1.0):
     """The scale at which the mean of ``c/(t+a)`` over t < T is exactly 1."""
@@ -86,7 +91,28 @@ def default_reciprocal_scale(max_positions, offset=1.0):
     return max_positions / denom
 
 
-def reciprocal_probe_stats(pred, valid, scale, offset, max_positions):
+@lru_cache(maxsize=16)
+def _position_weights(max_positions, scale, offset):
+    """``[T]`` squared-Jacobian weights, normalised to mean 1, on CPU (float64).
+
+    ``|dt/dy| = (t+a)^2/c``, so weighting a squared target error by its square turns
+    the loss into squared position error. Normalising by the mean over the configured
+    T keeps the loss's scale comparable to the unweighted version and constant across
+    batches -- a short final batch must not change the loss's units.
+    """
+    t = torch.arange(max_positions, dtype=torch.float64)
+    w = ((t + offset) ** 2 / scale) ** 2
+    return w / w.mean()
+
+
+@lru_cache(maxsize=16)
+def _jacobian(max_positions, scale, offset):
+    """``[T]`` un-normalised ``|dt/dy|``, for reporting error in positions."""
+    t = torch.arange(max_positions, dtype=torch.float64)
+    return (t + offset) ** 2 / scale
+
+
+def reciprocal_probe_stats(pred, valid, scale, offset, max_positions, weighted=True):
     """Loss and summable statistics for a batch.
 
     Args:
@@ -94,12 +120,13 @@ def reciprocal_probe_stats(pred, valid, scale, offset, max_positions):
         valid:         ``[B, T]`` bool, False at padded positions.
         scale:         the target scale ``c`` (> 0).
         offset:        the denominator offset ``a`` (> 0).
-        max_positions: the configured sequence length; fixes the clamp range.
+        max_positions: the configured sequence length; fixes the weights and clamps.
+        weighted:      apply the squared-Jacobian weighting.
 
     Returns:
-        ``(loss, stats)`` -- ``loss`` is the summed squared error (fairseq divides by
-        the sample size), ``stats`` holds per-batch sums that aggregate exactly across
-        batches and workers.
+        ``(loss, stats)`` -- ``loss`` is the summed (weighted) squared error, which
+        fairseq divides by the sample size; ``stats`` holds per-batch sums that
+        aggregate exactly across batches and workers.
     """
     B, T = pred.shape
     t_idx = torch.arange(T, device=pred.device).unsqueeze(0).expand(B, T)
@@ -107,24 +134,50 @@ def reciprocal_probe_stats(pred, valid, scale, offset, max_positions):
 
     p = pred[valid]
     r = target[valid]
-    ti = t_idx[valid].to(pred.dtype)
+    ti_long = t_idx[valid]
+    ti = ti_long.to(pred.dtype)
 
-    loss = (p - r).pow(2).sum()
+    err_sq = (p - r).pow(2)
+    if weighted:
+        w = _position_weights(max_positions, scale, offset).to(
+            device=pred.device, dtype=pred.dtype
+        )[ti_long]
+        loss = (w * err_sq).sum()
+    else:
+        loss = err_sq.sum()
 
     with torch.no_grad():
-        # c/(t+a) runs from c/a at t=0 down to c/(T-1+a) at the last position. Clamp
-        # into that range before inverting, so a prediction at or below zero maps to
-        # the last position rather than to inf or a negative index.
+        # First-order error in positions: |dt/dy| * |dy|. Reported as pos_rmse.
+        jac = _jacobian(max_positions, scale, offset).to(
+            device=pred.device, dtype=pred.dtype
+        )[ti_long]
+        pos_sq = (jac * (p - r)).pow(2)
+
+        # c/(t+a) runs from c/a at t=0 down to c/(T-1+a). Clamp into that range before
+        # inverting, so a prediction at or below zero maps to the last position rather
+        # than to inf or a negative index.
         clamped = p.clamp(min=scale / (max_positions - 1 + offset), max=scale / offset)
         t_hat = torch.round(scale / clamped - offset)
+        abs_diff = (t_hat - ti).abs()
+
         stats = {
             "rp_total": p.numel(),
-            "rp_sq_err": loss.detach(),
+            "rp_sq_err": err_sq.sum(),
+            "rp_weighted_err": loss.detach(),
+            "rp_pos_sq_err": pos_sq.sum(),
             "rp_r_sum": r.sum(),
             "rp_r_sq_sum": r.pow(2).sum(),
-            "rp_abs_diff": (t_hat - ti).abs().sum(),
+            "rp_abs_diff": abs_diff.sum(),
             "rp_correct": (t_hat == ti).sum(),
         }
+
+        # Where the error actually is: mad within each quarter of the sequence.
+        bucket = (ti_long * N_BUCKETS // max_positions).clamp(max=N_BUCKETS - 1)
+        for b in range(N_BUCKETS):
+            sel = bucket == b
+            stats[f"rp_mad_q{b + 1}"] = abs_diff[sel].sum()
+            stats[f"rp_n_q{b + 1}"] = sel.sum()
+
     return loss, stats
 
 
@@ -134,18 +187,27 @@ class ReciprocalPositionProbeConfig(FairseqDataclass):
         default=0.0,
         metadata={
             "help": "scale c in the target c/(t+a). 0 (default) resolves to "
-            "T / sum_t 1/(t+a), which makes the mean target exactly 1. Must be >= 0. "
-            "Changes only the loss's units and the optimisation, never r2/mad/accuracy."
+            "T / sum_t 1/(t+a), which makes the mean target exactly 1. Must be >= 0."
         },
     )
     reciprocal_offset: float = field(
         default=1.0,
         metadata={
             "help": "offset a in the denominator of c/(t+a). Must be > 0. a=1 is the "
-            "prefix-mean weight the network actually computes, and the only value a "
-            "linear probe can fit exactly; larger a compresses the target's range and "
-            "makes r2 harder to fool, but caps a perfect linear probe (R^2 <= 0.60 at "
-            "a=10, 0.31 at a=50), so raise it only with --non-linear-probe."
+            "prefix-mean weight the network computes and the only value a linear probe "
+            "can fit exactly; larger a compresses the target's range but caps the "
+            "linear arms (R^2 <= 0.60 at a=10, 0.31 at a=50)."
+        },
+    )
+    reciprocal_loss_weight: str = field(
+        default="jacobian",
+        metadata={
+            "help": "'jacobian' (default) weights each squared error by ((t+a)^2/c)^2, "
+            "so the loss is squared error in POSITION space and every position "
+            "contributes on the same scale; plain MSE is near-blind to late positions "
+            "(0.01 of target error is 0.3 positions at t=50 but 24.7 at t=511). "
+            "'none' restores plain MSE. Expect r2 (target space) to fall while mad and "
+            "pos_rmse improve."
         },
     )
     tokens_per_sample: int = II("task.tokens_per_sample")
@@ -154,7 +216,12 @@ class ReciprocalPositionProbeConfig(FairseqDataclass):
 @register_criterion("reciprocal_position_probe", dataclass=ReciprocalPositionProbeConfig)
 class ReciprocalPositionProbeCriterion(FairseqCriterion):
     def __init__(
-        self, task, reciprocal_scale=0.0, reciprocal_offset=1.0, tokens_per_sample=512
+        self,
+        task,
+        reciprocal_scale=0.0,
+        reciprocal_offset=1.0,
+        reciprocal_loss_weight="jacobian",
+        tokens_per_sample=512,
     ):
         super().__init__(task)
         self.max_positions = int(tokens_per_sample)
@@ -167,21 +234,37 @@ class ReciprocalPositionProbeCriterion(FairseqCriterion):
         assert reciprocal_scale >= 0, (
             f"--reciprocal-scale must be >= 0 (0 = auto), got {reciprocal_scale}"
         )
+        assert reciprocal_loss_weight in ("jacobian", "none"), (
+            f"--reciprocal-loss-weight must be 'jacobian' or 'none', got "
+            f"{reciprocal_loss_weight!r}"
+        )
         self.offset = float(reciprocal_offset)
         self.scale = (
             float(reciprocal_scale)
             if reciprocal_scale > 0
             else default_reciprocal_scale(self.max_positions, self.offset)
         )
+        self.weighted = reciprocal_loss_weight == "jacobian"
 
         logger.info(
-            "reciprocal probe: target = %.4f / (t + %.4f) over T=%d (range %.4f .. %.4f)",
+            "reciprocal probe: target = %.4f / (t + %.4f) over T=%d (range %.4f .. %.4f), "
+            "loss weighting = %s",
             self.scale,
             self.offset,
             self.max_positions,
             self.scale / (self.max_positions - 1 + self.offset),
             self.scale / self.offset,
+            reciprocal_loss_weight,
         )
+        if self.weighted:
+            w = _position_weights(self.max_positions, self.scale, self.offset)
+            logger.info(
+                "  squared-Jacobian weights (mean 1): %.2e at t=0, %.4f at t=T/2, "
+                "%.2f at t=T-1",
+                w[0].item(),
+                w[self.max_positions // 2].item(),
+                w[-1].item(),
+            )
 
     def forward(self, model, sample, reduce=True):
         """Compute the loss for the given sample.
@@ -204,7 +287,7 @@ class ReciprocalPositionProbeCriterion(FairseqCriterion):
         valid = sample["target"].ne(self.padding_idx)
 
         loss, stats = reciprocal_probe_stats(
-            pred, valid, self.scale, self.offset, self.max_positions
+            pred, valid, self.scale, self.offset, self.max_positions, self.weighted
         )
         loss = loss.float()
         sample_size = int(stats["rp_total"])
@@ -230,19 +313,22 @@ class ReciprocalPositionProbeCriterion(FairseqCriterion):
         if n == 0:
             return
 
-        # Plain per-token MSE in scaled units -- no log(2) conversion, this is not a
-        # log probability.
-        metrics.log_scalar("loss", total("rp_sq_err") / n, n, round=6)
+        # The optimised quantity, per token. No log(2) conversion -- not a log prob.
+        metrics.log_scalar("loss", total("rp_weighted_err") / n, n, round=6)
 
         # Accumulate raw sums and derive the ratios from them (the pattern
-        # dpp_cross_entropy_fix uses for accuracy), so r2, mad and accuracy are exact
-        # over the whole validation set rather than averages of per-batch values --
-        # which for R^2 would not be the same number.
-        for key in ("rp_total", "rp_sq_err", "rp_r_sum", "rp_r_sq_sum",
-                    "rp_abs_diff", "rp_correct"):
+        # dpp_cross_entropy_fix uses for accuracy), so r2, mad, pos_rmse and the
+        # per-quarter mads are exact over the whole validation set rather than
+        # averages of per-batch values -- which for R^2 would not be the same number.
+        keys = ["rp_total", "rp_sq_err", "rp_weighted_err", "rp_pos_sq_err",
+                "rp_r_sum", "rp_r_sq_sum", "rp_abs_diff", "rp_correct"]
+        keys += [f"rp_mad_q{b + 1}" for b in range(N_BUCKETS)]
+        keys += [f"rp_n_q{b + 1}" for b in range(N_BUCKETS)]
+        for key in keys:
             metrics.log_scalar(key, total(key), round=6)
 
         def r2(meters):
+            # Unweighted, target space, so it stays comparable across loss weightings.
             count = meters["rp_total"].sum
             sst = meters["rp_r_sq_sum"].sum - meters["rp_r_sum"].sum ** 2 / count
             if sst <= 0:
@@ -250,6 +336,16 @@ class ReciprocalPositionProbeCriterion(FairseqCriterion):
             return round(1.0 - meters["rp_sq_err"].sum / sst, 5)
 
         metrics.log_derived("r2", r2)
+        metrics.log_derived(
+            "mse",
+            lambda meters: round(meters["rp_sq_err"].sum / meters["rp_total"].sum, 6),
+        )
+        metrics.log_derived(
+            "pos_rmse",
+            lambda meters: round(
+                (meters["rp_pos_sq_err"].sum / meters["rp_total"].sum) ** 0.5, 3
+            ),
+        )
         metrics.log_derived(
             "mad",
             lambda meters: round(meters["rp_abs_diff"].sum / meters["rp_total"].sum, 3),
@@ -260,6 +356,14 @@ class ReciprocalPositionProbeCriterion(FairseqCriterion):
                 100.0 * meters["rp_correct"].sum / meters["rp_total"].sum, 3
             ),
         )
+        for b in range(N_BUCKETS):
+            def _mad_q(meters, b=b):
+                cnt = meters[f"rp_n_q{b + 1}"].sum
+                if cnt <= 0:
+                    return float("nan")
+                return round(meters[f"rp_mad_q{b + 1}"].sum / cnt, 3)
+
+            metrics.log_derived(f"mad_q{b + 1}", _mad_q)
 
     @staticmethod
     def logging_outputs_can_be_summed() -> bool:

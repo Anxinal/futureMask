@@ -123,6 +123,21 @@ PROBE_TARGET=${PROBE_TARGET:-reciprocal}
 RECIPROCAL_SCALE=${RECIPROCAL_SCALE:-0}
 RECIPROCAL_OFFSET=${RECIPROCAL_OFFSET:-1}
 
+# RECIPROCAL_LOSS_WEIGHT: 'jacobian' (default) or 'none'.
+#   Plain MSE on c/(t+a) is nearly blind to late positions -- the target spans 103x at
+#   a=5, so 75% of its variance is in the first 10 positions, while the inversion
+#   amplifies error quadratically (|dt/dy| = (t+a)^2/c: 0.01 of target error is 0.3
+#   positions at t=50 but 24.7 at t=511). Job 867271 showed the consequence: loss 0.15
+#   and R2 0.96 with MAD still 71 of 512. Under plain MSE a probe that goes blind after
+#   t=100 scores BETTER than one that is uniformly 2 positions off.
+#   'jacobian' weights each squared error by ((t+a)^2/c)^2, making the loss squared
+#   error in POSITION space, so every position contributes on the same scale (a
+#   constant position error then varies only 1.5x across the sequence, against 2000x
+#   before). Weights are normalised to mean 1, so the loss keeps its old numeric range.
+#   Expect r2 and mse (target space, early-dominated) to WORSEN while mad, pos_rmse and
+#   the per-quarter mads improve -- that is the trade, not a regression.
+RECIPROCAL_LOSS_WEIGHT=${RECIPROCAL_LOSS_WEIGHT:-jacobian}
+
 # Read r2 TOGETHER WITH mad. At a=1 both the loss and r2 are dominated by early
 # positions: a probe that resolves only t < 10 and guesses a constant afterwards
 # scores r2 ~ 0.96 while being off by ~157 positions on average. mad and accuracy
@@ -140,6 +155,14 @@ case "${PROBE_TARGET}" in
         TARGET_TAG="_recip"
         if [ "${RECIPROCAL_SCALE}" != "0" ]; then TARGET_TAG="${TARGET_TAG}_c${RECIPROCAL_SCALE}"; fi
         if [ "${RECIPROCAL_OFFSET}" != "1" ]; then TARGET_TAG="${TARGET_TAG}_a${RECIPROCAL_OFFSET}"; fi
+        # The weighting changes what the loss means, so weighted runs get their own
+        # tag and never overwrite or skip an unweighted result.
+        case "${RECIPROCAL_LOSS_WEIGHT}" in
+            jacobian) TARGET_TAG="${TARGET_TAG}_jw" ;;
+            none)     ;;
+            *) echo "FATAL: RECIPROCAL_LOSS_WEIGHT must be 'jacobian' or 'none', got '${RECIPROCAL_LOSS_WEIGHT}'" >&2
+               exit 1 ;;
+        esac
         ;;
     *)
         echo "FATAL: PROBE_TARGET must be 'position' or 'reciprocal', got '${PROBE_TARGET}'" >&2
@@ -221,6 +244,12 @@ if [ "${PROBE_TARGET}" = "reciprocal" ]; then
     done
     if [ "${RECIPROCAL_SCALE}" = "0" ]; then
         echo "  scale auto: c = T / sum_t 1/(t+a). Set RECIPROCAL_SCALE > 0 to override."
+    fi
+    if [ "${RECIPROCAL_LOSS_WEIGHT}" = "jacobian" ]; then
+        echo "  loss weighting: jacobian -- squared error in POSITION space, so every"
+        echo "    position counts alike. Expect r2/mse to fall and mad/pos_rmse to improve."
+    else
+        echo "  loss weighting: none -- plain MSE, early positions dominate."
     fi
 fi
 
@@ -536,6 +565,7 @@ for cond_str in "${CONDITIONS[@]}"; do
                 TRAIN_ARGS+=(
                     "--reciprocal-scale=${RECIPROCAL_SCALE}"
                     "--reciprocal-offset=${RECIPROCAL_OFFSET}"
+                    "--reciprocal-loss-weight=${RECIPROCAL_LOSS_WEIGHT}"
                 )
             else
                 TRAIN_ARGS+=(--fp16)
@@ -560,7 +590,8 @@ import json, os, sys
 #   2026-09-17 10:00:00 | INFO | valid | {\"epoch\": 1, \"valid_mad\": ...}
 # -- the JSON is a suffix, not the whole line. Matching on line.startswith('{')
 # found nothing and silently recorded nan; parse from the first brace instead.
-val_loss = accuracy = mad = r2 = float('nan')
+val_loss = accuracy = mad = r2 = pos_rmse = float('nan')
+mad_q = [float('nan')] * 4
 num_updates = -1
 try:
     with open('${TRAIN_LOG}') as f:
@@ -580,6 +611,12 @@ try:
                 mad = float(rec['valid_mad'])
             if 'valid_r2' in rec:
                 r2 = float(rec['valid_r2'])
+            if 'valid_pos_rmse' in rec:
+                pos_rmse = float(rec['valid_pos_rmse'])
+            for b in range(4):
+                key = 'valid_mad_q' + str(b + 1)
+                if key in rec:
+                    mad_q[b] = float(rec[key])
             if 'valid_num_updates' in rec:
                 num_updates = int(float(rec['valid_num_updates']))
 except OSError:
@@ -608,6 +645,8 @@ result = {
     'r2': r2,
     'accuracy': accuracy,
     'mad': mad,
+    'pos_rmse': pos_rmse,
+    'mad_by_quarter': mad_q,
     'num_updates': num_updates,
 }
 # Record the target actually used, with the auto scale resolved to its number.
@@ -616,6 +655,7 @@ if '${PROBE_TARGET}' == 'reciprocal':
     a = float('${RECIPROCAL_OFFSET}')
     result['reciprocal_scale'] = float('${RECIPROCAL_SCALE}') or T / sum(1.0 / (t + a) for t in range(T))
     result['reciprocal_offset'] = float('${RECIPROCAL_OFFSET}')
+    result['loss_weight'] = '${RECIPROCAL_LOSS_WEIGHT}'
 
 with open('${RESULT_FILE}', 'w') as f:
     json.dump(result, f, indent=2)
@@ -652,8 +692,10 @@ for EVAL_LEN in "${EVAL_LENGTHS[@]}"; do
     echo ""
     echo "--- Eval sequence length: ${EVAL_LEN} ---"
     echo ""
-    printf "%-15s  %5s  %9s  %8s  %8s  %8s  %10s\n" "CONDITION" "LAYER" "VAL_LOSS" "R2" "ACC(%)" "MAD" "UPDATES"
-    printf "%-15s  %5s  %9s  %8s  %8s  %8s  %10s\n" "---------------" "-----" "---------" "--------" "--------" "--------" "----------"
+    printf "%-15s %5s %9s %8s %7s %7s %8s %6s %6s %6s %6s %8s\n" \
+        "CONDITION" "LAYER" "VAL_LOSS" "R2" "ACC(%)" "MAD" "POSRMSE" "MAD_Q1" "MAD_Q2" "MAD_Q3" "MAD_Q4" "UPDATES"
+    printf "%-15s %5s %9s %8s %7s %7s %8s %6s %6s %6s %6s %8s\n" \
+        "---------------" "-----" "---------" "--------" "-------" "-------" "--------" "------" "------" "------" "------" "--------"
 
     for cond_str in "${CONDITIONS[@]}"; do
         IFS='|' read -r COND_NAME COND_EXTRA <<< "${cond_str}"
@@ -663,21 +705,26 @@ for EVAL_LEN in "${EVAL_LENGTHS[@]}"; do
             RESULT_FILE="${RESULTS_DIR}/${PROBE_TAG}.json"
 
             if [ -f "${RESULT_FILE}" ]; then
-                read -r VAL_LOSS R2 ACC MAD UPDATES <<< "$("${PY}" -c "
+                read -r VAL_LOSS R2 ACC MAD POSRMSE Q1 Q2 Q3 Q4 UPDATES <<< "$("${PY}" -c "
 import json
 d = json.load(open('${RESULT_FILE}'))
+q = d.get('mad_by_quarter', [float('nan')] * 4)
 print(f\"{d['val_loss']:.4g}\",
       f\"{d.get('r2', float('nan')):.4f}\",
       f\"{d.get('accuracy', float('nan')):.3f}\",
       f\"{d.get('mad', float('nan')):.2f}\",
+      f\"{d.get('pos_rmse', float('nan')):.2f}\",
+      *[f\"{v:.1f}\" for v in q],
       d['num_updates'])
 ")"
             else
-                VAL_LOSS="N/A"; R2="N/A"; ACC="N/A"; MAD="N/A"; UPDATES="N/A"
+                VAL_LOSS="N/A"; R2="N/A"; ACC="N/A"; MAD="N/A"; POSRMSE="N/A"
+                Q1="N/A"; Q2="N/A"; Q3="N/A"; Q4="N/A"; UPDATES="N/A"
             fi
 
-            printf "%-15s  %5s  %9s  %8s  %8s  %8s  %10s\n" \
-                "${COND_NAME}" "${LAYER_IDX}" "${VAL_LOSS}" "${R2}" "${ACC}" "${MAD}" "${UPDATES}"
+            printf "%-15s %5s %9s %8s %7s %7s %8s %6s %6s %6s %6s %8s\n" \
+                "${COND_NAME}" "${LAYER_IDX}" "${VAL_LOSS}" "${R2}" "${ACC}" "${MAD}" \
+                "${POSRMSE}" "${Q1}" "${Q2}" "${Q3}" "${Q4}" "${UPDATES}"
         done
     done
 done
