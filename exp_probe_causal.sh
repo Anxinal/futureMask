@@ -79,96 +79,39 @@ PROBE_WARMUP=500
 PROBE_MAX_TOKENS=8192
 PROBE_VALIDATE_EVERY=500
 
-# ---- Probe target -----------------------------------------------------------
-# position   : classify the absolute position t (criterion dpp_cross_entropy_fix).
-# reciprocal : regress c/(t+1) + b (criterion reciprocal_position_probe). Under the
-#              Q/K pin, 1/(t+1) is the prefix-mean weight -- the only
-#              position-dependent quantity the network computes -- so this asks
-#              whether the probe can read that signal directly, rather than invert it.
-PROBE_TARGET=${PROBE_TARGET:-reciprocal}
+# ---- Probe loss: cross-entropy + distance penalty ---------------------------
+# The probe classifies the absolute position (criterion dpp_cross_entropy_fix). Every
+# token contributes one -log p(true position) term, so every position counts alike --
+# unlike the reciprocal regression this replaced, whose 100x target range let the
+# first ten positions carry 75% of the loss.
+#
+# Cross-entropy is blind to ORDER, though: predicting 301 for 300 costs the same as
+# predicting 0. DISTANCE_PENALTY (lambda) adds the expected position distance,
+#
+#     loss = CE + lambda * E_p[|k - t|] / T
+#
+# whose gradient pushes each class down in proportion to how much farther it is than
+# the current expected distance. Absolute distance, so no position is favoured.
+# Override per job:   DISTANCE_PENALTY=20 sbatch exp_probe_causal.sh
+#
+# What to expect (SYNTHETIC pilot, 1-D signal at this model's information floor): the
+# penalty lowers argmax MAD only modestly -- 13.4 -> 12.4 at lambda=100, for ~0.2
+# points of accuracy -- because a classifier on a monotone signal already confuses
+# mainly NEIGHBOURING positions. The median readout (mad_median, always reported)
+# reached 12.1 with no penalty at all. On real, entangled hidden states the penalty
+# may matter more; comparing lambda=0 against lambda=20..100 is the test.
+#
+# lambda goes into the run tag ("_dp0", "_dp20"), so sweeps never collide, and the
+# old untagged classification results (earlier probe, parser-nan metrics) can never
+# be mistaken for finished runs and skipped.
+DISTANCE_PENALTY=${DISTANCE_PENALTY:-0}
 
-# ---- Reciprocal target  c/(t+a)  --  ADJUST SCALE AND OFFSET HERE ------------
-# Edit the defaults below, or override per job without touching this file:
-#
-#     RECIPROCAL_SCALE=512 RECIPROCAL_OFFSET=10 sbatch exp_probe_causal.sh
-#
-# RECIPROCAL_SCALE (c) : 0 = auto, T / sum_t 1/(t+a), which makes the mean target
-#     exactly 1 (about 75 down to 0.15 at T=512, a=1). Unscaled, late targets are
-#     ~2e-3, far from the probe's natural output range. Must be >= 0. Multiplicative,
-#     so it cannot change r2, mad or accuracy -- only the loss's units.
-# RECIPROCAL_OFFSET (a): denominator offset, default 1. Must be > 0. This one does
-#     reshape the target. Measured at T=512:
-#
-#         a      range     R^2 of a probe resolving      ceiling for a LINEAR probe
-#                          only t<10, guessing after
-#         1       512x             0.959                          1.000
-#         10       52x             0.613                          0.601
-#         50       11x             0.277                          0.306
-#
-#     Larger a compresses the range and stops r2 flattering a probe that resolves
-#     nothing late. The cost lands on the LINEAR arms only: the network computes
-#     1/(t+1), and c/(t+a) is a Moebius transform of it that no linear map can
-#     produce. The *_mlp arms (--non-linear-probe) can represent it and are uncapped.
-#
-#     a=1 is the default because it keeps the linear-vs-MLP contrast clean -- that
-#     contrast is the experiment's point, and at a != 1 a linear arm's shortfall
-#     mixes "not linearly decodable" with "target is not linear in the signal". At
-#     a != 1 the script prints the linear ceiling; read the linear arms against it.
-#
-# There is deliberately no "+ b" outside the fraction: the probe head's own trainable
-# bias absorbs such a term exactly (same weights, intercept shifted by b), so it
-# cannot move any metric. Non-default values go into the run tag (e.g.
-# "_recip_c512_a10"), so adjusting them starts fresh runs instead of being mistaken
-# for finished ones and skipped.
-RECIPROCAL_SCALE=${RECIPROCAL_SCALE:-0}
-RECIPROCAL_OFFSET=${RECIPROCAL_OFFSET:-1}
-
-# RECIPROCAL_LOSS_WEIGHT: 'jacobian' (default) or 'none'.
-#   Plain MSE on c/(t+a) is nearly blind to late positions -- the target spans 103x at
-#   a=5, so 75% of its variance is in the first 10 positions, while the inversion
-#   amplifies error quadratically (|dt/dy| = (t+a)^2/c: 0.01 of target error is 0.3
-#   positions at t=50 but 24.7 at t=511). Job 867271 showed the consequence: loss 0.15
-#   and R2 0.96 with MAD still 71 of 512. Under plain MSE a probe that goes blind after
-#   t=100 scores BETTER than one that is uniformly 2 positions off.
-#   'jacobian' weights each squared error by ((t+a)^2/c)^2, making the loss squared
-#   error in POSITION space, so every position contributes on the same scale (a
-#   constant position error then varies only 1.5x across the sequence, against 2000x
-#   before). Weights are normalised to mean 1, so the loss keeps its old numeric range.
-#   Expect r2 and mse (target space, early-dominated) to WORSEN while mad, pos_rmse and
-#   the per-quarter mads improve -- that is the trade, not a regression.
-RECIPROCAL_LOSS_WEIGHT=${RECIPROCAL_LOSS_WEIGHT:-jacobian}
-
-# Read r2 TOGETHER WITH mad. At a=1 both the loss and r2 are dominated by early
-# positions: a probe that resolves only t < 10 and guesses a constant afterwards
-# scores r2 ~ 0.96 while being off by ~157 positions on average. mad and accuracy
-# invert the prediction back to a position, and are comparable with the
-# classification probe's numbers. Position-probe results keep their original,
-# untagged names.
-
-case "${PROBE_TARGET}" in
-    position)
-        PROBE_CRITERION=dpp_cross_entropy_fix
-        TARGET_TAG=""
-        ;;
-    reciprocal)
-        PROBE_CRITERION=reciprocal_position_probe
-        TARGET_TAG="_recip"
-        if [ "${RECIPROCAL_SCALE}" != "0" ]; then TARGET_TAG="${TARGET_TAG}_c${RECIPROCAL_SCALE}"; fi
-        if [ "${RECIPROCAL_OFFSET}" != "1" ]; then TARGET_TAG="${TARGET_TAG}_a${RECIPROCAL_OFFSET}"; fi
-        # The weighting changes what the loss means, so weighted runs get their own
-        # tag and never overwrite or skip an unweighted result.
-        case "${RECIPROCAL_LOSS_WEIGHT}" in
-            jacobian) TARGET_TAG="${TARGET_TAG}_jw" ;;
-            none)     ;;
-            *) echo "FATAL: RECIPROCAL_LOSS_WEIGHT must be 'jacobian' or 'none', got '${RECIPROCAL_LOSS_WEIGHT}'" >&2
-               exit 1 ;;
-        esac
-        ;;
-    *)
-        echo "FATAL: PROBE_TARGET must be 'position' or 'reciprocal', got '${PROBE_TARGET}'" >&2
-        exit 1
-        ;;
-esac
+if awk -v l="${DISTANCE_PENALTY}" 'BEGIN{exit !(l < 0)}'; then
+    echo "FATAL: DISTANCE_PENALTY must be >= 0, got '${DISTANCE_PENALTY}'" >&2
+    exit 1
+fi
+RUN_TAG="_dp${DISTANCE_PENALTY}"
+echo "Probe loss: cross-entropy + ${DISTANCE_PENALTY} * expected position distance"
 
 # ---- Conditions to run ------------------------------------------------------
 # Each condition: NAME|EXTRA_FLAGS
@@ -204,54 +147,6 @@ EVAL_LENGTHS=(512)
 # ---- Probe layers (0 = embedding output, 1..N = decoder layer outputs) -----
 # For a 2-layer decoder: 0 = embedding, 1 = layer 0, 2 = layer 1
 PROBE_LAYERS=(0 1 2)
-
-# ---- Resolved reciprocal target ---------------------------------------------
-# Echo what the knobs above actually mean before anything trains. RECIPROCAL_SCALE=0
-# is a sentinel for "auto", NOT a multiplier of zero: it resolves to the c that makes
-# the mean of c/(t+a) equal 1.
-if [ "${PROBE_TARGET}" = "reciprocal" ]; then
-    if awk -v c="${RECIPROCAL_SCALE}" 'BEGIN{exit !(c < 0)}'; then
-        echo "FATAL: RECIPROCAL_SCALE must be >= 0 (0 = auto), got '${RECIPROCAL_SCALE}'" >&2
-        exit 1
-    fi
-    if awk -v a="${RECIPROCAL_OFFSET}" 'BEGIN{exit !(a <= 0)}'; then
-        echo "FATAL: RECIPROCAL_OFFSET must be > 0, got '${RECIPROCAL_OFFSET}'" >&2
-        exit 1
-    fi
-
-    for L in "${EVAL_LENGTHS[@]}"; do
-        EFF_C=$(awk -v c="${RECIPROCAL_SCALE}" -v a="${RECIPROCAL_OFFSET}" -v T="${L}" \
-            'BEGIN { if (c > 0) { printf "%.4f", c }
-                     else { s = 0; for (t = 0; t < T; t++) s += 1 / (t + a); printf "%.4f", T / s } }')
-        RANGE=$(awk -v c="${EFF_C}" -v a="${RECIPROCAL_OFFSET}" -v T="${L}" \
-            'BEGIN { printf "%.4f .. %.4f", c / (T - 1 + a), c / a }')
-        echo "Reciprocal target (T=${L}): ${EFF_C}/(t + ${RECIPROCAL_OFFSET})   [${RANGE}]"
-
-        # What a perfect LINEAR probe can reach: the best least-squares fit of
-        # c/(t+a) from the 1/(t+1) the network actually computes. Exactly 1 at a=1.
-        if [ "${RECIPROCAL_OFFSET}" != "1" ]; then
-            CEIL=$(awk -v c="${EFF_C}" -v a="${RECIPROCAL_OFFSET}" -v T="${L}" \
-                'BEGIN { for (t = 0; t < T; t++) { u = 1/(t+1); y = c/(t+a)
-                             su += u; sy += y; suu += u*u; suy += u*y; syy += y*y }
-                         d = T*suu - su*su
-                         w = (T*suy - su*sy) / d; b = (sy - w*su) / T
-                         sse = syy - 2*w*suy - 2*b*sy + w*w*suu + 2*w*b*su + T*b*b
-                         sst = syy - sy*sy/T
-                         printf "%.3f", 1 - sse/sst }')
-            echo "  a != 1: a perfect LINEAR probe is capped at R2 = ${CEIL} here;" \
-                 "the *_mlp arms are not capped."
-        fi
-    done
-    if [ "${RECIPROCAL_SCALE}" = "0" ]; then
-        echo "  scale auto: c = T / sum_t 1/(t+a). Set RECIPROCAL_SCALE > 0 to override."
-    fi
-    if [ "${RECIPROCAL_LOSS_WEIGHT}" = "jacobian" ]; then
-        echo "  loss weighting: jacobian -- squared error in POSITION space, so every"
-        echo "    position counts alike. Expect r2/mse to fall and mad/pos_rmse to improve."
-    else
-        echo "  loss weighting: none -- plain MSE, early positions dominate."
-    fi
-fi
 
 # ---- Paths ------------------------------------------------------------------
 REPO_DIR="${SLURM_SUBMIT_DIR}"
@@ -489,7 +384,7 @@ for cond_str in "${CONDITIONS[@]}"; do
 
     for EVAL_LEN in "${EVAL_LENGTHS[@]}"; do
         for LAYER_IDX in "${PROBE_LAYERS[@]}"; do
-            PROBE_TAG="${COND_NAME}${TARGET_TAG}_seed${SEED}_layer${LAYER_IDX}_len${EVAL_LEN}"
+            PROBE_TAG="${COND_NAME}${RUN_TAG}_seed${SEED}_layer${LAYER_IDX}_len${EVAL_LEN}"
             SAVE_DIR="${CHECKPOINTS_ROOT}/${PROBE_TAG}"
             RESULT_FILE="${RESULTS_DIR}/${PROBE_TAG}.json"
 
@@ -512,8 +407,8 @@ for cond_str in "${CONDITIONS[@]}"; do
                 "${DATABIN}"
                 --task                          language_modeling_position_probe
                 --arch                          fixed_attn_probe
-                --criterion                     "${PROBE_CRITERION}"
-                --probe-target                  "${PROBE_TARGET}"
+                --criterion                     dpp_cross_entropy_fix
+                "--distance-penalty=${DISTANCE_PENALTY}"
                 --tokens-per-sample             "${EVAL_LEN}"
                 --probe-layer-idx               "${LAYER_IDX}"
                 --pretrained-decoder-filename   "${BASE_CKPT}"
@@ -535,6 +430,7 @@ for cond_str in "${CONDITIONS[@]}"; do
                 --max-update                    "${PROBE_MAX_UPDATES}"
                 --validate-interval-updates     "${PROBE_VALIDATE_EVERY}"
                 --skip-invalid-size-inputs-valid-test
+                --fp16
                 --save-dir                      "${SAVE_DIR}"
                 --save-interval-updates         "${PROBE_MAX_UPDATES}"
                 --keep-last-epochs              1
@@ -550,26 +446,6 @@ for cond_str in "${CONDITIONS[@]}"; do
                 # shellcheck disable=SC2206
                 TRAIN_ARGS+=(${COND_EXTRA})
             fi
-            # These belong to the reciprocal criterion's config, so passing them
-            # alongside dpp_cross_entropy_fix would be rejected. The "=" form avoids
-            # any value being parsed as an option name.
-            #
-            # The reciprocal probe trains in fp32. fp16 stores the probe's output with
-            # a step of ~1/1024 of its magnitude, and neighbouring late positions
-            # differ by only ~c/T^2: perfect predictions still invert exactly up to
-            # about a=200, but the margin shrinks as larger a bunches the targets
-            # together (98% accuracy at a=1000). fp32 keeps the offset knob safe across
-            # its whole range on a model this small. The classification probe's logits
-            # are not sensitive to this and keep fp16.
-            if [ "${PROBE_TARGET}" = "reciprocal" ]; then
-                TRAIN_ARGS+=(
-                    "--reciprocal-scale=${RECIPROCAL_SCALE}"
-                    "--reciprocal-offset=${RECIPROCAL_OFFSET}"
-                    "--reciprocal-loss-weight=${RECIPROCAL_LOSS_WEIGHT}"
-                )
-            else
-                TRAIN_ARGS+=(--fp16)
-            fi
 
             TRAIN_LOG="${SAVE_DIR}/train.log"
             printf '      %s\n' "python -m fairseq_cli.train ${TRAIN_ARGS[*]}"
@@ -582,7 +458,7 @@ import json, os, sys
 
 # Every metric in a row comes from the SAME (last) validation pass. val_loss used to
 # be read from the checkpoint's extra_state['best'] -- the best loss over training --
-# while accuracy/mad/r2 came from the last pass, so a row mixed two moments and
+# while accuracy/mad came from the last pass, so a row mixed two moments and
 # disagreed whenever the probe wobbled or overfitted. best_val_loss is still reported
 # alongside, clearly labelled.
 #
@@ -590,7 +466,7 @@ import json, os, sys
 #   2026-09-17 10:00:00 | INFO | valid | {\"epoch\": 1, \"valid_mad\": ...}
 # -- the JSON is a suffix, not the whole line. Matching on line.startswith('{')
 # found nothing and silently recorded nan; parse from the first brace instead.
-val_loss = accuracy = mad = r2 = pos_rmse = float('nan')
+val_loss = ce = exp_dist = accuracy = mad = mad_median = float('nan')
 mad_q = [float('nan')] * 4
 num_updates = -1
 try:
@@ -609,10 +485,12 @@ try:
                 accuracy = float(rec['valid_accuracy'])
             if 'valid_mad' in rec:
                 mad = float(rec['valid_mad'])
-            if 'valid_r2' in rec:
-                r2 = float(rec['valid_r2'])
-            if 'valid_pos_rmse' in rec:
-                pos_rmse = float(rec['valid_pos_rmse'])
+            if 'valid_ce' in rec:
+                ce = float(rec['valid_ce'])
+            if 'valid_exp_dist' in rec:
+                exp_dist = float(rec['valid_exp_dist'])
+            if 'valid_mad_median' in rec:
+                mad_median = float(rec['valid_mad_median'])
             for b in range(4):
                 key = 'valid_mad_q' + str(b + 1)
                 if key in rec:
@@ -636,26 +514,20 @@ if os.path.exists(ckpt_path):
 
 result = {
     'condition': '${COND_NAME}',
-    'probe_target': '${PROBE_TARGET}',
+    'distance_penalty': float('${DISTANCE_PENALTY}'),
     'probe_layer': ${LAYER_IDX},
     'eval_length': ${EVAL_LEN},
     'seed': ${SEED},
     'val_loss': val_loss,
     'best_val_loss': best_val_loss,
-    'r2': r2,
+    'ce_bits': ce,
+    'exp_dist': exp_dist,
     'accuracy': accuracy,
     'mad': mad,
-    'pos_rmse': pos_rmse,
+    'mad_median': mad_median,
     'mad_by_quarter': mad_q,
     'num_updates': num_updates,
 }
-# Record the target actually used, with the auto scale resolved to its number.
-if '${PROBE_TARGET}' == 'reciprocal':
-    T = ${EVAL_LEN}
-    a = float('${RECIPROCAL_OFFSET}')
-    result['reciprocal_scale'] = float('${RECIPROCAL_SCALE}') or T / sum(1.0 / (t + a) for t in range(T))
-    result['reciprocal_offset'] = float('${RECIPROCAL_OFFSET}')
-    result['loss_weight'] = '${RECIPROCAL_LOSS_WEIGHT}'
 
 with open('${RESULT_FILE}', 'w') as f:
     json.dump(result, f, indent=2)
@@ -676,55 +548,49 @@ echo "======================================================"
 echo "  FIXED-ATTENTION PROBE RESULTS"
 echo "======================================================"
 echo ""
-echo "  Probe target: ${PROBE_TARGET}"
-if [ "${PROBE_TARGET}" = "reciprocal" ]; then
-    echo "  Target c/(t+a) with c=${RECIPROCAL_SCALE} (0 = auto), a=${RECIPROCAL_OFFSET}."
-    echo "  VAL_LOSS is the MSE in those units. Chance is R2 ~ 0."
-    echo "  Read R2 together with MAD: R2 is dominated by early positions and stays"
-    echo "  high for a probe with almost no late-position resolution."
-else
-    echo "  Loss is in bits. Chance for ${TOKENS_PER_SAMPLE} positions is"
-    echo "  log2(${TOKENS_PER_SAMPLE} + 5) bits with accuracy ~0."
-fi
+echo "  Loss: cross-entropy + ${DISTANCE_PENALTY} * expected position distance."
+echo "  CE is pure cross-entropy in bits; chance for ${TOKENS_PER_SAMPLE} positions is"
+echo "  log2(${TOKENS_PER_SAMPLE} + 5) ~ 9.0 bits, accuracy ~0.2%, MAD ~171."
+echo "  MAD reads the argmax, MAD_MED the median of the predicted distribution;"
+echo "  MAD_Q1..Q4 are argmax MAD within each quarter of the sequence."
 echo "  Layer 0 (embedding, no positional embeddings) MUST sit at chance."
 
 for EVAL_LEN in "${EVAL_LENGTHS[@]}"; do
     echo ""
     echo "--- Eval sequence length: ${EVAL_LEN} ---"
     echo ""
-    printf "%-15s %5s %9s %8s %7s %7s %8s %6s %6s %6s %6s %8s\n" \
-        "CONDITION" "LAYER" "VAL_LOSS" "R2" "ACC(%)" "MAD" "POSRMSE" "MAD_Q1" "MAD_Q2" "MAD_Q3" "MAD_Q4" "UPDATES"
-    printf "%-15s %5s %9s %8s %7s %7s %8s %6s %6s %6s %6s %8s\n" \
-        "---------------" "-----" "---------" "--------" "-------" "-------" "--------" "------" "------" "------" "------" "--------"
+    printf "%-15s %5s %8s %7s %7s %8s %6s %6s %6s %6s %8s\n" \
+        "CONDITION" "LAYER" "CE(bits)" "ACC(%)" "MAD" "MAD_MED" "MAD_Q1" "MAD_Q2" "MAD_Q3" "MAD_Q4" "UPDATES"
+    printf "%-15s %5s %8s %7s %7s %8s %6s %6s %6s %6s %8s\n" \
+        "---------------" "-----" "--------" "-------" "-------" "--------" "------" "------" "------" "------" "--------"
 
     for cond_str in "${CONDITIONS[@]}"; do
         IFS='|' read -r COND_NAME COND_EXTRA <<< "${cond_str}"
 
         for LAYER_IDX in "${PROBE_LAYERS[@]}"; do
-            PROBE_TAG="${COND_NAME}${TARGET_TAG}_seed${SEED}_layer${LAYER_IDX}_len${EVAL_LEN}"
+            PROBE_TAG="${COND_NAME}${RUN_TAG}_seed${SEED}_layer${LAYER_IDX}_len${EVAL_LEN}"
             RESULT_FILE="${RESULTS_DIR}/${PROBE_TAG}.json"
 
             if [ -f "${RESULT_FILE}" ]; then
-                read -r VAL_LOSS R2 ACC MAD POSRMSE Q1 Q2 Q3 Q4 UPDATES <<< "$("${PY}" -c "
+                read -r CE ACC MAD MADMED Q1 Q2 Q3 Q4 UPDATES <<< "$("${PY}" -c "
 import json
 d = json.load(open('${RESULT_FILE}'))
 q = d.get('mad_by_quarter', [float('nan')] * 4)
-print(f\"{d['val_loss']:.4g}\",
-      f\"{d.get('r2', float('nan')):.4f}\",
+print(f\"{d.get('ce_bits', float('nan')):.3f}\",
       f\"{d.get('accuracy', float('nan')):.3f}\",
       f\"{d.get('mad', float('nan')):.2f}\",
-      f\"{d.get('pos_rmse', float('nan')):.2f}\",
+      f\"{d.get('mad_median', float('nan')):.2f}\",
       *[f\"{v:.1f}\" for v in q],
       d['num_updates'])
 ")"
             else
-                VAL_LOSS="N/A"; R2="N/A"; ACC="N/A"; MAD="N/A"; POSRMSE="N/A"
+                CE="N/A"; ACC="N/A"; MAD="N/A"; MADMED="N/A"
                 Q1="N/A"; Q2="N/A"; Q3="N/A"; Q4="N/A"; UPDATES="N/A"
             fi
 
-            printf "%-15s %5s %9s %8s %7s %7s %8s %6s %6s %6s %6s %8s\n" \
-                "${COND_NAME}" "${LAYER_IDX}" "${VAL_LOSS}" "${R2}" "${ACC}" "${MAD}" \
-                "${POSRMSE}" "${Q1}" "${Q2}" "${Q3}" "${Q4}" "${UPDATES}"
+            printf "%-15s %5s %8s %7s %7s %8s %6s %6s %6s %6s %8s\n" \
+                "${COND_NAME}" "${LAYER_IDX}" "${CE}" "${ACC}" "${MAD}" "${MADMED}" \
+                "${Q1}" "${Q2}" "${Q3}" "${Q4}" "${UPDATES}"
         done
     done
 done

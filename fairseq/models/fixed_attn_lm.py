@@ -96,16 +96,8 @@ class FixedAttnLanguageModelConfig(TransformerLanguageModelConfig):
     )
     non_linear_probe: bool = field(
         default=False,
-        metadata={"help": "if True, use a 2-layer MLP probe with ReLU instead of linear"},
-    )
-    probe_target: str = field(
-        default="position",
-        metadata={
-            "help": "what the probe predicts. 'position': classify the absolute position t "
-            "(criterion dpp_cross_entropy_fix). 'reciprocal': regress 1/(t+1), the "
-            "prefix-mean weight that is the only position-dependent quantity under the "
-            "Q/K pin (criterion reciprocal_position_probe)."
-        },
+        metadata={"help": "if True, use a 3-layer MLP probe (hidden width 2d, ReLU, "
+                          "biased hidden layers) instead of linear"},
     )
     decoder_head_mask_spec: str = field(
         default="",
@@ -206,19 +198,12 @@ class FixedAttnLanguageModel(TransformerLanguageModel):
             p.requires_grad_(False)
 
         # ---- Build probe layers ----
-        probe_target = safe_getattr(args, "probe_target", "position")
-        assert probe_target in ("position", "reciprocal"), (
-            f"--probe-target must be 'position' or 'reciprocal', got {probe_target!r}"
-        )
-        if probe_target == "reciprocal":
-            # One scalar per token: the predicted 1/(t+1). The output layer gets a bias,
-            # unlike the classification head -- a regression with no intercept would have
-            # to find a constant direction in the residual stream to fit the target's
-            # nonzero mean, and R^2 is not well defined without one.
-            out_dim, out_bias = 1, True
-        else:
-            out_dim = args.tokens_per_sample + decoder.dictionary.nspecial + 1
-            out_bias = False
+        # One logit per position class. Classes start after the special symbols
+        # (see get_lprobs_and_target in cross_entropy_decoder_position_probe.py). No
+        # bias on the output layer: every position occurs exactly once per block, so
+        # the classes are perfectly balanced and a learned prior would add nothing.
+        out_dim = args.tokens_per_sample + decoder.dictionary.nspecial + 1
+        out_bias = False
 
         def make_linear(in_f, out_f, bias=False):
             m = nn.Linear(in_f, out_f, bias=bias)
@@ -235,10 +220,11 @@ class FixedAttnLanguageModel(TransformerLanguageModel):
             # output -- while the position signal under the Q/K pin lives in the
             # *magnitude* of the prefix mean (its variance falls as 1/(t+1)). The
             # biases give the ReLU units thresholds, which is what lets them respond
-            # to magnitude. Measured on a simulation of this setting, the hidden bias
-            # lifted R^2 from 0.40 to 0.53 and the extra depth/width beyond that was
-            # worth a further ~0.06, while the bidirectional control stayed at chance
-            # throughout -- the capacity is not manufacturing signal.
+            # to magnitude. Measured on a simulation of this setting (with a regression
+            # readout), the hidden bias lifted R^2 from 0.40 to 0.53 and the extra
+            # depth/width beyond that was worth a further ~0.06, while the
+            # bidirectional control stayed at chance throughout -- the capacity is not
+            # manufacturing signal.
             hidden = args.decoder_output_dim * 2
             probe = nn.Sequential(
                 make_linear(args.decoder_output_dim, hidden, bias=True),
@@ -293,7 +279,6 @@ class FixedAttnBaseLanguageModel(TransformerLanguageModel):
 
 @register_model_architecture("fixed_attn_lm", "fixed_attn_probe")
 def fixed_attn_probe(args):
-    args.probe_target = safe_getattr(args, "probe_target", "position")
     args.decoder_layers = safe_getattr(args, "decoder_layers", 2)
     args.decoder_attention_heads = safe_getattr(args, "decoder_attention_heads", 1)
     args.no_token_positional_embeddings = True

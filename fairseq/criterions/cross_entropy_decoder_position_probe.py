@@ -25,14 +25,31 @@ class DPPCrossEntropyCriterionConfig(FairseqDataclass):
         metadata={"help": "report accuracy metric"},
     )
 
+    distance_penalty: float = field(
+        default=0.0,
+        metadata={
+            "help": "lambda in  loss = CE + lambda * E_p[|k - t|] / T. Cross-entropy is "
+            "blind to ordering -- predicting 301 for 300 costs the same as predicting "
+            "0 -- so this adds the expected position distance under the predicted "
+            "distribution. Its gradient w.r.t. logit j is p_j (d_j - E_p[d]): every "
+            "class is pushed down in proportion to how much farther it is than the "
+            "current expected distance. Absolute distance, so every position is "
+            "weighted alike. 0 (default) is plain cross-entropy."
+        },
+    )
+
 
 @register_criterion("dpp_cross_entropy_fix", dataclass=DPPCrossEntropyCriterionConfig)
 class DPPCrossEntropyCriterion(FairseqCriterion):
-    def __init__(self, task, sentence_avg, dont_report_accuracy=False):
+    def __init__(self, task, sentence_avg, dont_report_accuracy=False, distance_penalty=0.0):
         super().__init__(task)
         self.sentence_avg = sentence_avg
         self.positions = [i for i in range(8192)]  # We start from 5 to ignore the special tokens
         self.report_accuracy = not dont_report_accuracy
+        assert distance_penalty >= 0, (
+            f"--distance-penalty must be >= 0, got {distance_penalty}"
+        )
+        self.distance_penalty = float(distance_penalty)
 
     def forward(self, model, sample, reduce=True):
         """Compute the loss for the given sample.
@@ -61,12 +78,30 @@ class DPPCrossEntropyCriterion(FairseqCriterion):
 
         lprobs, target = get_lprobs_and_target(self.positions, self.padding_idx, model, net_output, sample)
 
-        loss, _ = self.compute_loss(lprobs, target, reduce=reduce)
+        nll, _ = self.compute_loss(lprobs, target, reduce=reduce)
+        ordinal = ordinal_stats(
+            lprobs, target, self.padding_idx, model.decoder.dictionary.nspecial + 1
+        )
+
+        # The distance penalty is a loss term, so autograd delivers the
+        # distance-proportional gradient -- no custom backward needed.
+        if self.distance_penalty > 0:
+            if reduce:
+                loss = nll + self.distance_penalty * ordinal["exp_dist"].sum()
+            else:
+                per_token = t.zeros_like(nll)
+                per_token[target.ne(self.padding_idx)] = ordinal["exp_dist"]
+                loss = nll + self.distance_penalty * per_token
+        else:
+            loss = nll
+
         sample_size = (
             sample["target"].size(0) if self.sentence_avg else sample["ntokens"]
         )
         logging_output = {
             "loss": loss.data,
+            "ce_sum": nll.sum().data,
+            "exp_dist_sum": utils.item(ordinal["exp_dist"].sum().data),
             "ntokens": sample["ntokens"],
             "nsentences": sample["target"].size(0),
             "sample_size": sample_size,
@@ -78,6 +113,12 @@ class DPPCrossEntropyCriterion(FairseqCriterion):
 
             abs_diff_sum = self.compute_mean_absolute_difference(lprobs, target)
             logging_output["abs_diff_sum"] = utils.item(abs_diff_sum.data)
+
+            logging_output["abs_diff_median_sum"] = utils.item(ordinal["abs_median"].sum().data)
+            for b in range(N_BUCKETS):
+                sel = ordinal["bucket"] == b
+                logging_output[f"mad_q{b + 1}_sum"] = utils.item(ordinal["abs_argmax"][sel].sum().data)
+                logging_output[f"n_q{b + 1}"] = utils.item(sel.sum().data)
 
         # Print out some examples:
         #lprobs, target = get_lprobs_and_target(self.positions, self.padding_idx, model, net_output, sample)
@@ -183,6 +224,49 @@ class DPPCrossEntropyCriterion(FairseqCriterion):
                 else float("nan"),
             )
 
+            # Median of the predicted distribution: the readout that minimises
+            # expected absolute error, so the natural companion to mad. When the probe
+            # spreads mass over neighbouring late positions, the argmax picks one of
+            # them somewhat arbitrarily; the median does not.
+            metrics.log_scalar(
+                "abs_diff_median_sum",
+                utils.item(sum(log.get("abs_diff_median_sum", 0) for log in logging_outputs)),
+            )
+            metrics.log_derived(
+                "mad_median",
+                lambda meters: round(
+                    meters["abs_diff_median_sum"].sum / meters["total"].sum, 3
+                )
+                if meters["total"].sum > 0
+                else float("nan"),
+            )
+
+            # mad (argmax) within each quarter of the sequence -- where the error is.
+            for b in range(N_BUCKETS):
+                metrics.log_scalar(
+                    f"mad_q{b + 1}_sum",
+                    utils.item(sum(log.get(f"mad_q{b + 1}_sum", 0) for log in logging_outputs)),
+                )
+                metrics.log_scalar(
+                    f"n_q{b + 1}",
+                    utils.item(sum(log.get(f"n_q{b + 1}", 0) for log in logging_outputs)),
+                )
+
+                def _mad_q(meters, b=b):
+                    cnt = meters[f"n_q{b + 1}"].sum
+                    return round(meters[f"mad_q{b + 1}_sum"].sum / cnt, 3) if cnt > 0 else float("nan")
+
+                metrics.log_derived(f"mad_q{b + 1}", _mad_q)
+
+        # Pure cross-entropy in bits, and the expected normalised distance, logged
+        # separately so both stay readable when distance_penalty > 0 -- "loss" is then
+        # their weighted sum. With distance_penalty = 0, ce equals loss.
+        ce_sum = sum(log.get("ce_sum", 0) for log in logging_outputs)
+        metrics.log_scalar("ce", ce_sum / sample_size / math.log(2), sample_size, round=3)
+        if total > 0:
+            exp_dist_sum = sum(log.get("exp_dist_sum", 0) for log in logging_outputs)
+            metrics.log_scalar("exp_dist", exp_dist_sum / total, total, round=5)
+
     @staticmethod
     def logging_outputs_can_be_summed() -> bool:
         """
@@ -191,6 +275,48 @@ class DPPCrossEntropyCriterion(FairseqCriterion):
         to True will improves distributed training speed.
         """
         return True
+
+
+N_BUCKETS = 4
+
+
+def ordinal_stats(lprobs, target, padding_idx, class_offset):
+    """Position-aware quantities over the non-padded tokens.
+
+    Class index k encodes position k - class_offset (``get_lprobs_and_target`` shifts
+    positions past the special symbols). Returns, per valid token:
+
+      exp_dist    E_p[|k - t|] / T, the expected normalised distance -- the penalty
+                  term, differentiable through the softmax.
+      abs_argmax  |argmax - t| in positions (no grad).
+      abs_median  |median of p - t| in positions (no grad).
+      bucket      which quarter of the sequence t falls in (no grad).
+    """
+    valid = target.ne(padding_idx)
+    lp = lprobs[valid]                                   # [N, C], float32
+    tgt = target[valid]                                  # [N]
+    n_classes = lp.size(-1)
+    n_pos = n_classes - class_offset                     # positions the head expresses
+
+    p = lp.exp()
+    class_pos = t.arange(n_classes, device=lp.device, dtype=lp.dtype) - class_offset
+    true_pos = (tgt - class_offset).to(lp.dtype)
+    dist = (class_pos.unsqueeze(0) - true_pos.unsqueeze(1)).abs() / n_pos
+    exp_dist = (p * dist).sum(-1)
+
+    with t.no_grad():
+        argmax_pos = (lp.argmax(-1) - class_offset).to(lp.dtype)
+        # First class at which the CDF reaches 1/2. argmax over a bool tensor returns
+        # the first True.
+        median_pos = ((p.cumsum(-1) >= 0.5).to(lp.dtype).argmax(-1) - class_offset).to(lp.dtype)
+        bucket = (true_pos.long() * N_BUCKETS // n_pos).clamp(0, N_BUCKETS - 1)
+
+    return {
+        "exp_dist": exp_dist,
+        "abs_argmax": (argmax_pos - true_pos).abs(),
+        "abs_median": (median_pos - true_pos).abs(),
+        "bucket": bucket,
+    }
 
 
 def get_lprobs_and_target(all_positions, padding_idx, model, net_output, sample):
@@ -207,9 +333,15 @@ def get_lprobs_and_target(all_positions, padding_idx, model, net_output, sample)
     #if mask.shape[0] != batch_size:
     #    mask = mask[0].expand(batch_size,dim)
 
+    # Shift positions past the special symbols FIRST, then mark padding. The other
+    # order (fill with padding_idx, then add the offset) turned every padded slot into
+    # class padding_idx + nspecial + 1, so ignore_index no longer skipped it: padded
+    # tokens were trained to predict position 1 and counted in accuracy and mad.
+    # Class indices start at nspecial + 1 > padding_idx, so a real position can never
+    # collide with it.
     pos_target = t.tensor(positions).expand(batch_size, dim).to(sample['target'])
-    pos_target = pos_target.masked_fill(mask, padding_idx)
-    sample['target'] = pos_target + model.decoder.dictionary.nspecial + 1
+    pos_target = pos_target + model.decoder.dictionary.nspecial + 1
+    sample['target'] = pos_target.masked_fill(mask, padding_idx)
     #######################
 
     lprobs = lprobs.view(-1, lprobs.size(-1))
