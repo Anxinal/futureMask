@@ -37,6 +37,16 @@ trap 'error_handler ${LINENO}' ERR
 # ---- Fixed-attention decoder architecture -----------------------------------
 DECODER_LAYERS=2
 DECODER_HEADS=1
+
+# Heads at PROBE time. The cf arm needs two, one per mask, and a spec must name every
+# head. The base LM keeps DECODER_HEADS=1 and is NOT retrained: q/k/v/out_proj are
+# [d, d] whatever the head count, so the checkpoint still loads with strict=True.
+#
+# The other arms do not change meaning. Under the Q/K pin every head shares the same
+# uniform attention matrix A, so splitting the value dims across heads and
+# concatenating gives [A @ V_0, A @ V_1] = A @ V -- identical to one head. Head count
+# only matters when the heads carry DIFFERENT masks, which is exactly the cf arm.
+PROBE_HEADS=2
 DECODER_EMBED_DIM=512
 DECODER_FFN_DIM=2048
 TOKENS_PER_SAMPLE=512
@@ -121,24 +131,43 @@ echo "Probe loss: cross-entropy + ${DISTANCE_PENALTY} * expected position distan
 # With Q/K pinned to zero every attention logit is 0, so attention is an exact
 # uniform average over whatever the mask leaves visible:
 #
-# causal    = default causal mask. Position t reads the prefix mean
-#             1/(t+1) * sum_{j<=t} v_j -- that 1/(t+1) is the only
-#             position-dependent quantity in the network, and is the signal
-#             being probed for.
-# nocausal  = bidirectional mask. Every position reads the same global mean, so
-#             hidden states vary only by token identity through the residual and
-#             carry no position. This is the control and should sit at chance.
-# *_mlp     = same masks, 2-layer MLP probe instead of linear. Bounds how much of
+# causal    = C,C. Position t reads the prefix mean 1/(t+1) * sum_{j<=t} v_j. That
+#             1/(t+1) is the position signal, and its precision decays with t: the
+#             per-step change is 1/(t+1) against a fixed ~9% spread in the mean, so
+#             late positions blur together.
+# cf        = C,F. One causal head, one future-only head (diagonal kept), so the
+#             second head averages over T-t tokens and carries 1/(T-t) -- the mirror
+#             signal, sharp exactly where the causal head is blunt. Predicted
+#             resolution in positions, per quarter:
+#
+#                 C,C   5.7  17.0  28.3  39.6   (worst at the END, mean 22.7)
+#                 C,F   5.6  14.2  14.2   5.6   (worst in the MIDDLE, mean 9.9)
+#
+#             So the signature is a symmetric U in MAD_Q1..Q4 rather than a rising
+#             ramp, with the worst quarter roughly halved. If cf instead looks like
+#             causal, the future half of the signal is not being used.
+# nocausal  = B,B. Every position reads the same global mean, so hidden states vary
+#             only by token identity through the residual and carry no position. The
+#             control: it must sit at chance.
+# *_mlp     = same masks, 3-layer MLP probe instead of linear. Bounds how much of
 #             the signal is linearly decodable vs. merely present.
 #
-# All four arms share ONE causally-trained base LM; only the probe-time mask and
-# probe type differ. Training a bidirectional base LM would be degenerate -- with
-# next-token targets, position t would attend over token t+1, its own label.
+# All arms share ONE causally-trained base LM; only the probe-time mask and probe type
+# differ. That makes this a test of what each mask structure EXPOSES in a frozen
+# representation, not of how a model trained with that mask would behave -- an F head
+# cannot be trained into a next-token LM, since position t would attend over its own
+# label. (The encoder-side experiment is where trained future masks belong.)
 CONDITIONS=(
-    "causal|"
-    "causal_mlp|--non-linear-probe"
-    "nocausal|--decoder-head-mask-spec B"
-    "nocausal_mlp|--decoder-head-mask-spec B --non-linear-probe"
+    "causal|--decoder-head-mask-spec C,C"
+    "causal_mlp|--decoder-head-mask-spec C,C --non-linear-probe"
+    "cf|--decoder-head-mask-spec C,F"
+    "cf_mlp|--decoder-head-mask-spec C,F --non-linear-probe"
+    "nocausal|--decoder-head-mask-spec B,B"
+    "nocausal_mlp|--decoder-head-mask-spec B,B --non-linear-probe"
+    # Uncomment to confirm the mechanism directly: F,F should mirror causal --
+    # worst at the START, best at the end. Adds 2 of the 18 runs' worth of time.
+    # "future|--decoder-head-mask-spec F,F"
+    # "future_mlp|--decoder-head-mask-spec F,F --non-linear-probe"
 )
 
 # ---- Sequence lengths to evaluate ------------------------------------------
@@ -413,7 +442,7 @@ for cond_str in "${CONDITIONS[@]}"; do
                 --probe-layer-idx               "${LAYER_IDX}"
                 --pretrained-decoder-filename   "${BASE_CKPT}"
                 --decoder-layers                "${DECODER_LAYERS}"
-                --decoder-attention-heads       "${DECODER_HEADS}"
+                --decoder-attention-heads       "${PROBE_HEADS}"
                 --decoder-embed-dim             "${DECODER_EMBED_DIM}"
                 --decoder-ffn-embed-dim         "${DECODER_FFN_DIM}"
                 --no-token-positional-embeddings
